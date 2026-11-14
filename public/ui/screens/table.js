@@ -1,12 +1,10 @@
-// Écran 5 — la table : joueurs autour du réacteur, pince, coupe d'un câble.
-// Cet écran est public : il ne reçoit que publicView().
+// La table : joueurs autour du réacteur, pince, coupe d'un câble.
+// Tous les téléphones affichent la même table ; seul celui qui tient la pince peut couper.
 
 import { h, art, sleep, dur } from '../dom.js';
 import { ICON, reactorArt } from '../art.js';
-import { wireCard, flipToFace, openSheet, pips, toast } from '../components.js';
-import { WIRE_LABEL } from '../texts.js';
-import { publicView } from '../../state/privacy.js';
-import { cut } from '../../engine/game.js';
+import { wireCard, flipToFace, openSheet, pips, toast, roleCard, badgeChip } from '../components.js';
+import { WIRE_LABEL, BADGE_LABEL } from '../texts.js';
 
 /** Places autour de la table, dans le sens des aiguilles d'une montre en partant du haut. */
 function seatLayout(n) {
@@ -19,35 +17,74 @@ function seatLayout(n) {
   }
 }
 
+/** Peut-on couper depuis ce téléphone ? (porteur de la pince, ou hôte qui remplace un absent) */
+export function canCut(net) {
+  const g = net.room.game;
+  if (g.phase !== 'play') return false;
+  if (net.seat === g.holder) return true;
+  const holder = net.room.members[g.holder];
+  return net.isHost && !holder.online;
+}
+
 export function tableScreen(ctx) {
-  const { store } = ctx;
-  const view = publicView(store.game);
+  const { net } = ctx;
+  const room = net.room;
+  const view = room.game;
+  const me = net.seat;
   const holder = view.players[view.holder];
+  const holderMember = room.members[view.holder];
+  const mine = me === view.holder;
+  const standIn = !mine && canCut(net); // l'hôte joue pour un joueur hors ligne
   const layout = seatLayout(view.n);
+  const aim = room.aim;
 
   function pick(i) {
     const p = view.players[i];
-    if (i === view.holder) { ctx.sound.error(); toast(`${p.name} tient la pince : on ne coupe jamais ses propres câbles.`, { tone: 'warn' }); return; }
+    if (!canCut(net)) {
+      ctx.sound.error();
+      toast(`C’est ${holder.name} qui tient la pince.`);
+      return;
+    }
+    if (i === view.holder) { ctx.sound.error(); toast(mine ? 'On ne coupe jamais ses propres câbles.' : `${holder.name} ne peut pas couper ses propres câbles.`, { tone: 'warn' }); return; }
     if (!p.hidden) { ctx.sound.error(); toast(`${p.name} n’a plus de câble caché.`, { tone: 'warn' }); return; }
     ctx.sound.tap();
-    openTarget(ctx, view, i);
+    openTarget(ctx, i);
   }
 
   const seat = (i) => {
     const p = view.players[i];
+    const m = room.members[i];
     const isHolder = i === view.holder;
-    const cls = ['seat', isHolder ? 'holder' : '', !isHolder && p.hidden ? 'pickable' : '', !p.hidden ? 'empty' : ''].filter(Boolean).join(' ');
+    const aimed = aim && aim.target === i;
+    const cls = ['seat', isHolder ? 'holder' : '', canCut(net) && !isHolder && p.hidden ? 'pickable' : '', !p.hidden ? 'empty' : '',
+      i === me ? 'me' : '', aimed ? 'aimed' : '', m.online ? '' : 'off'].filter(Boolean).join(' ');
     return h('button', {
       class: cls, 'data-seat': String(i),
-      'aria-label': `${p.name}, ${p.hidden} câble${p.hidden > 1 ? 's' : ''} caché${p.hidden > 1 ? 's' : ''}${isHolder ? ', tient la pince' : ''}`,
+      'aria-label': `${p.name}${i === me ? ' (toi)' : ''}, ${p.hidden} câble${p.hidden > 1 ? 's' : ''} caché${p.hidden > 1 ? 's' : ''}${isHolder ? ', tient la pince' : ''}${m.online ? '' : ', hors ligne'}`,
       onClick: () => pick(i),
     },
       h('span', { class: 'seat-head' },
-        p.badge ? h('span', { class: `bdot ${p.badge}`, title: `Badge ${p.badge === 'blue' ? 'bleu' : 'orange'}` }) : null,
-        h('span', { class: 'nm' }, p.name)),
-      h('span', { class: 'minis' }, p.wires.map((w) => h('i', { class: w.cut ? `mini cut ${w.kind}` : 'mini' }))),
+        p.badge ? h('span', { class: `bdot ${p.badge}`, title: `Badge ${BADGE_LABEL[p.badge]}` }) : null,
+        h('span', { class: 'nm' }, p.name),
+        i === me ? h('span', { class: 'you' }, 'toi') : null,
+        m.online ? null : h('span', { class: 'offdot', title: 'Hors ligne' })),
+      h('span', { class: 'minis' }, p.wires.map((w, slot) => h('i', { class: w.cut ? `mini cut ${w.kind}` : `mini${aimed && aim.slot === slot ? ' aim' : ''}` }))),
       isHolder ? h('span', { class: 'pince-tag', html: ICON.pince }) : null);
   };
+
+  let who;
+  if (mine) {
+    who = [h('div', { class: 'turn-name' }, h('b', { id: 'holderName' }, 'À toi'), ' de couper !'),
+      h('div', { class: 'turn-hint' }, 'Touche un autre joueur pour choisir un de ses câbles')];
+  } else if (standIn) {
+    who = [h('div', { class: 'turn-name' }, h('b', { id: 'holderName' }, holder.name), ' est hors ligne'),
+      h('div', { class: 'turn-hint' }, 'Tu es l’hôte : coupe à sa place pour débloquer la table')];
+  } else {
+    who = [h('div', { class: 'turn-name' }, h('b', { id: 'holderName' }, holder.name), ' tient la pince'),
+      h('div', { class: 'turn-hint' }, holderMember.online
+        ? (aim ? `${holder.name} vise un câble de ${view.players[aim.target].name}…` : 'Discutez : c’est lui ou elle qui choisit.')
+        : 'Hors ligne : l’hôte peut couper à sa place')];
+  }
 
   return h('section', { class: `screen table n${view.n}` },
     h('header', { class: 'hud' },
@@ -63,25 +100,25 @@ export function tableScreen(ctx) {
         art(reactorArt(view.found, view.total, 'idle'), 'reactor-art')),
       h('div', { class: 'col col-right' }, layout.right.map(seat))),
 
-    h('footer', { class: 'turnbar' },
-      h('div', { class: 'turn-who' },
-        h('span', { class: 'pince-big', html: ICON.pince }),
-        h('div', null,
-          h('div', { class: 'turn-name' }, h('b', { id: 'holderName' }, holder.name), ' tient la pince'),
-          h('div', { class: 'turn-hint' }, 'Touche un autre joueur pour couper un de ses câbles'))),
-      h('button', { class: 'btn sm', id: 'btnHistory', onClick: () => openHistory(view) },
-        h('span', { class: 'btn-ic', html: ICON.history }), `Coupés · ${view.log.length}`)));
+    h('footer', { class: `turnbar ${mine ? 'mine' : ''} ${standIn ? 'standin' : ''}`.trim() },
+      h('div', { class: 'turn-who' }, h('span', { class: 'pince-big', html: ICON.pince }), h('div', null, who)),
+      h('div', { class: 'turn-tools' },
+        h('button', { class: 'icon-btn', id: 'btnHistory', 'aria-label': `Câbles coupés : ${view.log.length}`, html: ICON.history, onClick: () => openHistory(view) }),
+        h('button', { class: 'btn sm', id: 'btnMyRole', onClick: () => openMyRole(ctx) }, 'Mon rôle'))));
 }
 
 // ───────────────────────────────────────────── Choix du câble
 
-function openTarget(ctx, view, target) {
-  const { store } = ctx;
+function openTarget(ctx, target) {
+  const { net } = ctx;
+  const view = net.room.game;
   const p = view.players[target];
-  const holder = view.players[view.holder];
+  const cutter = view.players[view.holder].name;
+  const mine = net.seat === view.holder;
   let selected = null;
-  const cutBtn = h('button', { class: 'btn primary big', id: 'btnCut', disabled: true },
-    h('span', { class: 'btn-ic', html: ICON.pince }), 'Couper ce câble');
+  let done = false;
+  net.send({ t: 'aim', target, slot: null });
+  const cutBtn = h('button', { class: 'btn primary big', id: 'btnCut', disabled: true }, h('span', { class: 'btn-ic', html: ICON.pince }), 'Couper ce câble');
   const cards = p.wires.map((w, slot) => {
     if (w.cut) return h('div', { class: 'slot done', 'data-slot': String(slot) }, wireCard({ kind: w.kind, flipped: true }));
     const btn = h('button', { class: 'slot', 'data-slot': String(slot), 'aria-label': `Câble caché numéro ${slot + 1}`, 'aria-pressed': 'false' }, wireCard());
@@ -90,81 +127,99 @@ function openTarget(ctx, view, target) {
       selected = selected === slot ? null : slot;
       cards.forEach((c) => { const on = Number(c.dataset.slot) === selected; c.classList.toggle('sel', on); if (c.tagName === 'BUTTON') c.setAttribute('aria-pressed', String(on)); });
       cutBtn.disabled = selected === null;
+      net.send({ t: 'aim', target, slot: selected });
     });
     return btn;
   });
 
   const sheet = openSheet(
     h('div', { class: 'target' },
-      h('p', { class: 'target-lead' }, h('b', null, holder.name), ', choisis le câble à couper. Tu peux encore changer d’avis.'),
+      h('p', { class: 'target-lead' }, mine ? 'Choisis le câble à couper. Tout le monde voit ce que tu vises ; tu peux encore changer d’avis.' : `Tu coupes à la place de ${cutter}, hors ligne.`),
       h('div', { class: `wire-row n${p.wires.length}`, id: 'targetWires' }, cards),
       h('div', { class: 'btn-col' },
         cutBtn,
         h('button', { class: 'btn big ghost', id: 'btnOther', onClick: () => sheet.close() }, 'Choisir un autre joueur'))),
-    { title: `Câbles de ${p.name}`, cls: 'target-sheet' });
+    {
+      title: `Câbles de ${p.name}`, cls: 'target-sheet',
+      onClose: () => { if (!done) net.send({ t: 'aim', target: null }); },
+    });
 
-  cutBtn.addEventListener('click', () => {
+  cutBtn.addEventListener('click', async () => {
     if (selected === null || cutBtn.disabled) return;
     cutBtn.disabled = true;
-    const next = cut(store.game, target, selected);
-    store.setGame(next); // enregistré avant toute animation : une coupe confirmée ne s'annule pas
-    sheet.close();
-    reveal(ctx, view, next);
+    done = true;
+    cutBtn.lastChild.textContent = 'Coupe en cours…';
+    const ok = await net.send({ t: 'cut', target, slot: selected });
+    if (ok) sheet.close();
+    else { done = false; cutBtn.disabled = false; cutBtn.lastChild.textContent = 'Couper ce câble'; }
   });
 }
 
-// ───────────────────────────────────────────── Révélation
+// ───────────────────────────────────────────── Révélation (sur tous les téléphones)
 
-async function reveal(ctx, before, next) {
-  const event = next.log.at(-1);
-  const after = publicView(next);
-  const byName = before.players[event.by].name;
-  const fromName = before.players[event.from].name;
+let current = null;
+
+/** Joue l'animation d'un câble coupé. `room` est l'état public juste après la coupe. */
+export async function showReveal(ctx, room) {
+  const { net } = ctx;
+  const view = room.game;
+  const event = view.log.at(-1);
+  if (current) current.remove();
+  const byName = view.players[event.by].name;
+  const fromName = view.players[event.from].name;
+  const meCut = net.seat === event.by;
+  const meNext = net.seat === event.from;
   const kind = event.kind;
 
   const card = wireCard({ cls: 'big' });
   const title = h('h2', { class: 'rv-title', id: 'revealTitle' });
   const sub = h('p', { class: 'rv-sub' });
   const then = h('p', { class: 'rv-then' });
-  const btn = h('button', { class: 'btn primary big', id: 'btnContinue' });
+  const btn = h('button', { class: 'btn primary big', id: 'btnContinue' }, 'Continuer');
   const overlay = h('div', { class: 'reveal', id: 'reveal', role: 'dialog', 'aria-modal': 'true', 'aria-label': 'Câble coupé' },
     h('div', { class: 'rv-fx' }),
-    h('p', { class: 'rv-lead' }, h('b', null, byName), ' coupe un câble de ', h('b', null, fromName), '…'),
+    h('p', { class: 'rv-lead' }, ...(meNext
+      ? [h('b', null, byName), ' coupe un de tes câbles…']
+      : [h('b', null, meCut ? 'Tu' : byName), meCut ? ' coupes un câble de ' : ' coupe un câble de ', h('b', null, fromName), '…'])),
     h('div', { class: 'rv-stage' }, card, h('div', { class: 'snip', html: ICON.pince })),
     h('div', { class: 'rv-result' }, title, sub, then, btn));
-  document.getElementById('layer').append(overlay);
+  current = overlay;
+  const close = () => { if (overlay.isConnected) overlay.remove(); if (current === overlay) current = null; };
+  btn.addEventListener('click', () => { ctx.sound.tap(); close(); });
+  document.getElementById('fx').append(overlay);
 
-  await sleep(dur(320));
+  await sleep(dur(260));
   overlay.classList.add('cutting');
   ctx.sound.snip();
   await sleep(dur(430));
   flipToFace(card, kind);
   await sleep(dur(520));
+  if (!overlay.isConnected) return;
 
   title.textContent = kind === 'overload' ? 'Surcharge !' : kind === 'bypass' ? 'Dérivation !' : WIRE_LABEL.inert;
   if (kind === 'overload') { sub.textContent = 'Le réacteur s’emballe…'; ctx.sound.overload(); }
-  else if (kind === 'bypass') { sub.textContent = `${after.found} sur ${after.total} trouvées.`; ctx.sound.bypass(); }
+  else if (kind === 'bypass') { sub.textContent = `${view.found} sur ${view.total} trouvées.`; ctx.sound.bypass(); }
   else { sub.textContent = 'Il ne se passe rien.'; ctx.sound.inert(); }
 
-  if (after.phase === 'over') {
-    then.textContent = kind === 'inert' ? 'C’était la dernière coupe de la partie.' : '';
-    btn.textContent = 'Voir le résultat';
-  } else if (after.phase === 'roundEnd') {
-    then.textContent = `La manche ${after.round} est terminée.`;
-    btn.textContent = 'Continuer';
-  } else {
-    then.append('La pince passe à ', h('b', null, fromName), '.');
-    btn.textContent = `Donner le téléphone à ${fromName}`;
-  }
+  if (view.phase === 'over') then.textContent = kind === 'inert' ? 'C’était la dernière coupe de la partie.' : '';
+  else if (view.phase === 'roundEnd') then.textContent = `La manche ${view.round} est terminée.`;
+  else if (meNext) { then.replaceChildren(h('b', null, 'La pince est pour toi !')); btn.textContent = 'À moi de jouer'; try { navigator.vibrate?.([60, 40, 120]); } catch { /* sans vibreur */ } }
+  else then.replaceChildren('La pince passe à ', h('b', null, fromName), '.');
   overlay.classList.add('shown', kind);
-  btn.addEventListener('click', () => {
-    ctx.sound.tap();
-    overlay.remove();
-    ctx.render();
-  });
+  // se ferme tout seul : personne n'a besoin de toucher l'écran pour que la partie continue
+  setTimeout(close, kind === 'inert' ? dur(2600) : dur(3600));
 }
 
-// ───────────────────────────────────────────── Historique des câbles coupés (public)
+// ───────────────────────────────────────────── Mon rôle, historique
+
+export function openMyRole(ctx) {
+  const priv = ctx.net.priv;
+  if (!priv) return;
+  openSheet(h('div', { class: 'myrole' },
+    roleCard(priv.role),
+    priv.neighbor ? h('div', { class: 'neighbor' }, badgeChip(priv.neighbor.badge, `${priv.neighbor.name}, à ta droite, porte un badge ${BADGE_LABEL[priv.neighbor.badge]}`)) : null,
+    h('p', { class: 'hint' }, 'Garde ton écran pour toi.')), { title: 'Mon rôle', cls: 'tall' });
+}
 
 function openHistory(view) {
   const rounds = [];

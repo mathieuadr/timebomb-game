@@ -86,7 +86,7 @@ export const ROLE_DOCS = [
     id: 'badge', title: 'Le badge, c’est quoi ?', tag: 'La couverture', color: 'neutral', badge: null,
     body: [
       'Le badge est la **couverture** d’un joueur : une couleur, bleue ou orange, que d’autres peuvent voir. **Ce n’est pas forcément son équipe réelle** — les agents doubles et l’Électron libre brouillent les pistes.',
-      '**Voisin de gauche** : pendant sa consultation privée, chacun découvre le badge de son voisin de droite, et lui seul.',
+      '**Voisin de gauche** : chacun découvre sur son téléphone le badge de son voisin de droite, et lui seul.',
       '**Toute la table** : les badges sont affichés sur le plateau pendant toute la partie.',
       '**Aucun badge** : on joue sans couverture, avec seulement les équipes secrètes.',
     ],
@@ -103,21 +103,22 @@ export const RULES = [
   {
     title: 'Le principe',
     body: [
-      'La station polaire est en alerte : son réacteur s’emballe. Autour de la table, deux équipes secrètes s’affrontent en se passant **un seul téléphone**. Tout le reste — discussions, bluff, accusations — se fait **à voix haute**.',
+      'La station polaire est en alerte : son réacteur s’emballe. Autour de la table, deux équipes secrètes s’affrontent. **Chacun joue sur son propre téléphone**, mais tout le reste — discussions, bluff, accusations — se fait **à voix haute**.',
       'Les **Techniciens** cherchent les **dérivations** pour stabiliser le réacteur. Les **Saboteurs** veulent faire couper la **Surcharge**, ou gagner du temps.',
     ],
   },
   {
     title: 'Mise en place',
     body: [
-      'Chaque joueur découvre son rôle **en privé**, puis consulte ses **5 câbles** : inertes, dérivations, ou la Surcharge. L’appli les mélange ensuite face cachée : personne ne sait plus où est quoi, pas même leur propriétaire.',
+      'Un joueur **crée la partie** et devient l’hôte. Les autres la **rejoignent** avec le code à 5 caractères ou le lien d’invitation. L’hôte range les joueurs dans l’ordre où ils sont assis, choisit les rôles en jeu, puis lance la partie.',
+      'Chacun découvre son **rôle** sur son téléphone, puis consulte ses **5 câbles** : inertes, dérivations, ou la Surcharge. L’appli les mélange ensuite face cachée : personne ne sait plus où est quoi, pas même leur propriétaire.',
       'Il y a autant de dérivations que de joueurs, et une seule Surcharge.',
     ],
   },
   {
     title: 'Un tour',
     body: [
-      'Le joueur qui tient la **pince** choisit **un autre joueur**, puis un de ses câbles cachés, et le coupe. Le câble est révélé à tous.',
+      'Le joueur qui tient la **pince** choisit **un autre joueur**, puis un de ses câbles cachés, et le coupe. Tous les téléphones montrent le câble révélé.',
       'La pince passe alors au joueur dont le câble vient d’être coupé. On ne coupe **jamais** ses propres câbles.',
       'Avant de couper, tout le monde peut annoncer ce qu’il a devant lui… en disant la vérité ou non.',
     ],
@@ -126,7 +127,7 @@ export const RULES = [
     title: 'Les manches',
     body: [
       'Une manche s’arrête quand on a coupé **autant de câbles qu’il y a de joueurs**. Les câbles restants sont ramassés, mélangés et redistribués : chacun en reçoit **un de moins** (5, puis 4, 3 et 2).',
-      'Chacun consulte ses nouveaux câbles en privé, puis le dernier joueur coupé commence la manche suivante.',
+      'Chacun consulte ses nouveaux câbles sur son téléphone, puis le dernier joueur coupé commence la manche suivante.',
     ],
   },
   {
@@ -139,10 +140,11 @@ export const RULES = [
     ],
   },
   {
-    title: 'Le téléphone partagé',
+    title: 'Chacun son téléphone',
     body: [
-      'Quand l’écran affiche un prénom, seul ce joueur regarde. Après chaque consultation, l’écran redevient neutre avant de changer de mains.',
-      'Aucun compte, aucune connexion : tout reste sur ce téléphone, et la partie reprend là où elle en était si l’appli se ferme.',
+      'Il faut une connexion Internet : les téléphones communiquent par un relais public. Ce que tu vois de secret (ton rôle, tes câbles, le badge de ton voisin) est **chiffré pour ton seul téléphone**.',
+      'Le téléphone de l’hôte fait l’arbitre. S’il se ferme, la partie se met en pause et reprend dès qu’il revient. Si un autre joueur perd la connexion, l’hôte peut jouer à sa place pour débloquer la table.',
+      'Aucun compte : ton prénom et la partie en cours restent sur ton téléphone.',
     ],
   },
 ];

@@ -117,9 +117,9 @@ export function toast(message, { tone = '' } = {}) {
 // ───────────────────────────────────────────── Réglages (sons, animations)
 
 export function settingToggles(ctx) {
-  const { store } = ctx;
+  const { prefs } = ctx;
   const mk = (key, on, off, label) => {
-    const active = store.settings[key];
+    const active = prefs[key];
     return h('button', {
       class: `icon-btn toggle ${active ? 'on' : ''}`,
       'aria-pressed': String(active),
@@ -135,10 +135,10 @@ export function settingToggles(ctx) {
 }
 
 export function settingRows(ctx) {
-  const { store } = ctx;
+  const { prefs } = ctx;
   const row = (key, label, hint) => h('label', { class: 'row-switch' },
     h('span', { class: 'rs-text' }, h('b', null, label), h('small', null, hint)),
-    h('input', { type: 'checkbox', class: 'switch', checked: store.settings[key], onChange: (e) => ctx.setSetting(key, e.target.checked, { silent: true }) }));
+    h('input', { type: 'checkbox', class: 'switch', checked: prefs[key], onChange: (e) => ctx.setSetting(key, e.target.checked, { silent: true }) }));
   return h('div', { class: 'rows' },
     row('sound', 'Sons', 'Coupes, révélations, fin de partie'),
     row('motion', 'Animations', 'Désactive pour un affichage plus sobre'));

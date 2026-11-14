@@ -1,26 +1,29 @@
-// Service worker : toute l'application est mise en cache à l'installation, puis servie
-// depuis le cache. Une partie entière se joue donc sans aucune connexion.
-// Quand le réseau est là, les fichiers sont rafraîchis en arrière-plan pour la prochaine ouverture.
-const VERSION = 'coupe-circuit-v1';
+// Service worker : l'application est mise en cache pour s'ouvrir vite et s'installer sur
+// l'écran d'accueil. Le réseau passe en priorité (une partie à plusieurs téléphones a de toute
+// façon besoin d'Internet) : tout le monde a ainsi la même version que l'hôte.
+const VERSION = 'coupe-circuit-v2';
 const SHELL = [
   './',
   './index.html',
   './style.css',
   './app.js',
   './manifest.webmanifest',
+  './vendor/mqtt.esm.js',
   './engine/rules.js',
   './engine/game.js',
   './state/store.js',
   './state/privacy.js',
+  './net/crypto.js',
+  './net/room.js',
   './ui/dom.js',
   './ui/art.js',
   './ui/sound.js',
   './ui/texts.js',
   './ui/components.js',
   './ui/screens/home.js',
-  './ui/screens/setup.js',
+  './ui/screens/lobby.js',
   './ui/screens/rules.js',
-  './ui/screens/pass.js',
+  './ui/screens/secret.js',
   './ui/screens/table.js',
   './ui/screens/roundEnd.js',
   './ui/screens/gameOver.js',
@@ -49,13 +52,11 @@ self.addEventListener('fetch', (event) => {
   if (req.method !== 'GET' || url.origin !== location.origin) return;
   const key = req.mode === 'navigate' ? './index.html' : req;
   event.respondWith(
-    caches.open(VERSION).then(async (cache) => {
-      const cached = await cache.match(key, { ignoreSearch: req.mode === 'navigate' });
-      const refresh = fetch(req)
-        .then((res) => { if (res.ok) cache.put(key, res.clone()); return res; })
-        .catch(() => null);
-      if (cached) { event.waitUntil(refresh); return cached; }
-      return (await refresh) || (await cache.match('./index.html')) || Response.error();
-    }),
+    fetch(req)
+      .then((res) => {
+        if (res.ok) { const copy = res.clone(); caches.open(VERSION).then((cache) => cache.put(key, copy)); }
+        return res;
+      })
+      .catch(async () => (await caches.match(key, { ignoreSearch: req.mode === 'navigate' })) || (await caches.match('./index.html')) || Response.error()),
   );
 });

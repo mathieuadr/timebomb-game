@@ -1,565 +1,470 @@
-// Test de bout en bout : des parties complètes jouées dans des téléphones émulés (Playwright).
+// Test de bout en bout : de vraies parties, un téléphone émulé par joueur (Playwright),
+// reliés par un relais MQTT local.
 //
-//   node test/e2e.mjs                 lance son propre serveur local
-//   URL="https://…/timebomb-game/" node test/e2e.mjs     contre le site publié
-//   OUT=dossier SCALE=2 node test/e2e.mjs                captures d'écran haute définition
+//   node test/e2e.mjs                       tous les scénarios
+//   ONLY=classique-5 node test/e2e.mjs      un seul scénario
+//   OUT=dossier SCALE=2 node test/e2e.mjs   captures d'écran haute définition
 //
-// Le test joue le rôle d'un arbitre omniscient : il lit la sauvegarde locale pour savoir quel
-// câble couper et pour vérifier que l'écran ne montre que ce qu'il a le droit de montrer.
+// Le test joue l'arbitre : il lit l'état complet dans le stockage du téléphone de l'hôte pour
+// savoir quel câble couper et vérifier que chaque écran ne montre que ce qu'il a le droit de montrer.
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
-import { start } from './serve.mjs';
+import { start, startBroker } from './serve.mjs';
 
-const { chromium, devices } = createRequire(import.meta.url)('playwright');
+const require = createRequire(import.meta.url);
+const { chromium, devices } = require('playwright');
+const mqtt = require('mqtt');
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const OUT = process.env.OUT || path.join(HERE, 'shots');
 const SCALE = Number(process.env.SCALE) || 1;
-const KEY = 'coupe-circuit:v1';
-const ROLE_NAME = { tech: 'Technicien', sab: 'Saboteur', mole: 'La Taupe', infiltrator: 'L’Infiltré', solo: 'L’Électron libre' };
 const ONLY = process.env.ONLY ? process.env.ONLY.split(',') : null;
-
+const ROLE_NAME = { tech: 'Technicien', sab: 'Saboteur', mole: 'La Taupe', infiltrator: 'L’Infiltré', solo: 'L’Électron libre' };
+const NS = 'coupe-circuit-v1';
 fs.mkdirSync(OUT, { recursive: true });
-let server = null;
-let URL_ = process.env.URL;
-if (!URL_) { const s = await start(Number(process.env.PORT) || 8099); server = s.server; URL_ = s.url; }
 
+const web = await start(Number(process.env.PORT) || 8099);
+const relay = await startBroker(Number(process.env.BROKER_PORT) || 8883);
+const APP = `${web.url}?broker=${encodeURIComponent(relay.url)}`;
 const browser = await chromium.launch();
 const errors = [];
 const done = [];
 
 // ───────────────────────────────────────────── outils
 
-async function phone(label, options, { seed = 1, css = '' } = {}) {
-  const context = await browser.newContext({ locale: 'fr-FR', serviceWorkers: 'allow', ...options });
-  // hasard reproductible : chaque scénario se déroule toujours de la même façon
-  await context.addInitScript((s) => {
-    let a = s >>> 0;
-    const next = () => { a = (a + 0x6d2b79f5) >>> 0; let t = a; t = Math.imul(t ^ (t >>> 15), t | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61); return (t ^ (t >>> 14)) >>> 0; };
-    Object.defineProperty(crypto, 'getRandomValues', { configurable: true, value: (arr) => { for (let i = 0; i < arr.length; i++) arr[i] = next(); return arr; } });
-  }, seed);
+const IPHONE = devices['iPhone 13'];
+const sized = (width, height, ua = IPHONE.userAgent) => ({ viewport: { width, height }, deviceScaleFactor: SCALE, isMobile: true, hasTouch: true, userAgent: ua });
+
+async function phone(label, device = IPHONE, { motion = false, url = APP } = {}) {
+  const context = await browser.newContext({ ...device, deviceScaleFactor: SCALE, locale: 'fr-FR' });
+  await context.addInitScript((m) => {
+    if (!localStorage.getItem('cc:prefs')) localStorage.setItem('cc:prefs', JSON.stringify({ name: '', sound: false, motion: m }));
+  }, motion);
   const page = await context.newPage();
   page.on('pageerror', (e) => errors.push(`${label} : ${e.message}`));
   page.on('console', (m) => { if (m.type() === 'error') errors.push(`${label} : console — ${m.text()}`); });
-  await page.goto(URL_);
+  await page.goto(url);
   await page.waitForFunction(() => window.__ccReady === true);
-  if (css) await page.addStyleTag({ content: css });
-  return { context, page, label };
+  const p = { label, context, page };
+  p.id = await page.evaluate(() => JSON.parse(localStorage.getItem('cc:device')).id);
+  return p;
 }
-
-const shot = async (page, name) => { await page.waitForTimeout(350); await page.screenshot({ path: path.join(OUT, `${name}.png`), scale: SCALE === 1 ? 'css' : 'device' }); };
-const game = (page) => page.evaluate((k) => JSON.parse(localStorage.getItem(k)).game, KEY);
+async function reload(p) {
+  await p.page.reload();
+  await p.page.waitForFunction(() => window.__ccReady === true);
+}
+const shot = async (p, name) => { await p.page.waitForTimeout(300); await p.page.screenshot({ path: path.join(OUT, `${name}.png`) }); };
 const text = async (page, sel) => (await page.textContent(sel)).trim();
-const passIdx = (g) => (g.holder + g.pass) % g.n;
-
-/** Rien de secret ne doit exister dans la page sur un écran public. */
-async function assertPublic(page, where, { badges = false } = {}) {
-  const found = await page.evaluate(() => {
-    const fronts = [...document.querySelectorAll('.wfront')].filter((el) => !el.closest('.slot.done') && !el.closest('#reveal'));
-    return {
-      faces: fronts.length,
-      roles: document.querySelectorAll('.rolecard:not(.back), .reminder-card, #app .portrait, .badge-pick, #neighborBadge, #handSummary').length,
-      hiddenKinds: [...document.querySelectorAll('.mini:not(.cut)')].filter((el) => el.className !== 'mini').length,
-      words: /Saboteur|Technicien|Taupe|Infiltré|Électron libre/i.test(document.getElementById('app').innerText),
-      badges: document.querySelectorAll('.bdot, .badge-chip').length,
-    };
-  });
-  const expectBadges = found.badges;
-  assert.deepEqual({ ...found, badges: 0 }, { faces: 0, roles: 0, hiddenKinds: 0, words: false, badges: 0 }, `fuite d'information sur l'écran « ${where} »`);
-  if (!badges) assert.equal(expectBadges, 0, `badge visible sur l'écran « ${where} »`);
-}
-
-async function setup(page, { n, names, mode, first, tweak }) {
-  await page.click('#btnNew');
-  await page.waitForSelector('#countPick');
-  await page.click(`#countPick button[data-v="${n}"]`);
-  for (let i = 0; i < n; i++) await page.locator('.name-input').nth(i).fill(names[i]);
-  if (mode) await page.click(`#modePick button[data-v="${mode}"]`);
-  if (tweak) await tweak(page);
-  if (first != null) await page.click(`#firstPick [data-first="${first}"]`);
-}
-const launch = async (page) => { await page.click('#btnLaunch'); await page.waitForSelector('#handoffName'); };
-
-/** Distribution des rôles : chaque joueur confirme, révèle, vérifie, masque. */
-async function passRoles(page, { badge = 'blue', shots = null, onSecond = null } = {}) {
-  let turn = 0;
+const hostState = (host) => host.page.evaluate(() => JSON.parse(localStorage.getItem('cc:host')));
+async function until(fn, what, timeout = 15000) {
+  const t = Date.now();
   for (;;) {
-    const g = await game(page);
-    if (g.phase !== 'roles') break;
-    const p = passIdx(g);
-    assert.equal(await text(page, '#handoffName'), g.players[p].name, 'le téléphone est demandé au bon joueur');
-    await assertPublic(page, 'passage du téléphone (rôles)');
-    if (shots && turn === 0) await shot(page, `${shots}-handoff`);
-    await page.click('#btnIam');
-    await page.waitForSelector('#btnReveal');
-    assert.equal(await page.locator('.rolecard:not(.back)').count(), 0, 'le rôle n\'est pas affiché avant d\'être demandé');
-    assert.ok(await page.locator('#btnHide').isDisabled(), 'impossible de passer sans avoir vu sa carte');
-    if (onSecond && turn === 1) { await onSecond(page, g, p); continue; }
-    await page.click('#btnReveal');
-    const role = g.roles[p];
-    assert.equal(await text(page, '.rolecard .rc-name'), ROLE_NAME[role.role], `carte Rôle de ${g.players[p].name}`);
-    if (role.team === 'solo' && g.comp.badges !== 'off') {
-      assert.ok(await page.locator('#btnHide').isDisabled(), 'l\'Électron libre doit choisir un badge');
-      if (shots) await shot(page, `${shots}-role-solo`);
-      await page.click(`.badge-pick.${badge}`);
-      assert.equal((await game(page)).roles[p].badge, badge);
-    } else if (role.badge) {
-      assert.ok((await text(page, '.rc-badge')).includes(role.badge === 'blue' ? 'bleu' : 'orange'));
-    }
-    if (shots && turn === 0) await shot(page, `${shots}-role`);
-    // cacher / revoir : la carte disparaît vraiment de la page
-    if (turn === 0) {
-      await page.click('#btnReveal');
-      assert.equal(await page.locator('.rolecard:not(.back)').count(), 0);
-      await page.click('#btnReveal');
-    }
-    await page.click('#btnHide');
-    await page.waitForFunction((k) => { const s = JSON.parse(localStorage.getItem(k)).game; return s.phase !== 'roles' || document.querySelector('#handoffName'); }, KEY);
-    turn += 1;
+    if (await fn().catch(() => false)) return;
+    if (Date.now() - t > timeout) throw new Error(`Délai dépassé : ${what}`);
+    await new Promise((r) => setTimeout(r, 60));
   }
 }
+const phaseIs = async (host, phase) => (await hostState(host)).game?.phase === phase;
+const phoneOf = (phones, id) => phones.find((p) => p.id === id);
 
-/** Consultation des câbles : chaque joueur révèle, vérifie, mélange. */
-async function passInspect(page, { shots = null } = {}) {
-  let turn = 0;
-  for (;;) {
-    const g = await game(page);
-    if (g.phase !== 'inspect') break;
-    const p = passIdx(g);
-    assert.equal(await text(page, '#handoffName'), g.players[p].name);
-    await assertPublic(page, 'passage du téléphone (câbles)', { badges: g.comp.badges === 'public' });
-    await page.click('#btnIam');
-    await page.waitForSelector('#btnReveal');
-    assert.equal(await page.locator('.wfront').count(), 0, 'aucun câble visible avant la demande');
-    assert.equal(await page.locator('.wire-row .wcard').count(), g.hands[p].length);
-    await page.click('#btnReveal');
-    assert.equal(await page.locator('.wfront').count(), g.hands[p].length);
-    const summary = await text(page, '#handSummary');
-    const count = (k) => g.hands[p].filter((c) => c.kind === k).length;
-    assert.ok(summary.includes(`${count('bypass')} dérivation`), `résumé des câbles : ${summary}`);
-    assert.ok(summary.includes(`${count('inert')} câble`), `résumé des câbles : ${summary}`);
-    assert.equal(summary.includes('Surcharge'), count('overload') === 1);
-    if (g.comp.badges === 'neighbor') {
-      const right = (p - 1 + g.n) % g.n;
-      const line = await text(page, '#neighborBadge');
-      assert.ok(line.includes(g.players[right].name) && line.includes(g.roles[right].badge === 'blue' ? 'bleu' : 'orange'), `badge du voisin : ${line}`);
+/** Aucun secret ne doit être visible ni présent dans la page sur un écran public. */
+async function assertPublic(p, where) {
+  const found = await p.page.evaluate(() => ({
+    faces: [...document.querySelectorAll('#app .wfront')].length,
+    roles: document.querySelectorAll('#app .rolecard:not(.back), #app .portrait').length,
+    hiddenKinds: [...document.querySelectorAll('.mini:not(.cut)')].filter((el) => !/^mini( aim)?$/.test(el.className)).length,
+    words: /Saboteur|Technicien|Taupe|Infiltré|Électron libre/i.test(document.getElementById('app').innerText),
+  }));
+  assert.deepEqual(found, { faces: 0, roles: 0, hiddenKinds: 0, words: false }, `fuite d'information chez ${p.label} (${where})`);
+}
+
+/** Écoute tout le trafic du relais pour une partie. */
+function spy(code) {
+  const seen = [];
+  const c = mqtt.connect(relay.url);
+  c.on('connect', () => c.subscribe(`${NS}/${code}/#`));
+  c.on('message', (topic, payload) => seen.push({ topic, raw: payload.toString() }));
+  return { seen, end: () => c.end(true) };
+}
+function assertSealed(seen) {
+  const secrets = /"(role|team|char|roles|hands|undealt|kinds|counts|neighbor)":/;
+  let n = 0;
+  for (const { topic, raw } of seen) {
+    if (!raw) continue;
+    const kind = topic.split('/')[2];
+    const msg = JSON.parse(raw);
+    if (kind === 'state' && msg.game?.phase !== 'over') assert.ok(!secrets.test(raw), 'secret en clair dans l\'état public');
+    if (kind === 'p') { assert.deepEqual(Object.keys(msg).sort(), ['ct', 'iv']); n += 1; }
+    if (kind === 'c' && msg.t !== 'join') assert.deepEqual(Object.keys(msg), ['box']);
+  }
+  assert.ok(n > 0, 'des états privés chiffrés ont circulé');
+}
+
+// ── salon
+
+async function createTable(host, guests, { invite = 1 } = {}) {
+  await host.page.fill('#name', host.label);
+  await host.page.click('#btnCreate');
+  await host.page.waitForSelector('#roomCode');
+  const code = await text(host.page, '#roomCode');
+  for (const [i, g] of guests.entries()) {
+    if (i < invite) {
+      // arrivée par le lien d'invitation
+      await g.page.goto(`${APP}&room=${code}`);
+      await g.page.waitForFunction(() => window.__ccReady === true);
+      await g.page.fill('#name', g.label);
+      assert.ok((await text(g.page, '.invite')).includes(code));
+      await g.page.click('#btnJoinInvite');
     } else {
-      assert.equal(await page.locator('#neighborBadge').count(), 0);
+      await g.page.fill('#name', g.label);
+      await g.page.fill('#code', code.toLowerCase());
+      await g.page.click('#btnJoin');
     }
-    if (turn === 0) {
-      await page.click('#btnRemind');
-      assert.ok((await text(page, '#reminderCard')).includes(ROLE_NAME[g.roles[p].role]));
-      if (shots) await shot(page, `${shots}-cables`);
-      await page.click('#btnRemind');
-      assert.equal(await page.locator('#reminderCard').count(), 0);
-    }
-    await page.click('#btnMix');
-    await page.waitForSelector('#btnReady');
-    assert.equal(await page.locator('.wfront').count(), 0, 'les câbles sont de nouveau cachés');
-    const after = await game(page);
-    assert.deepEqual(after.hands[p].map((c) => c.kind).sort(), g.hands[p].map((c) => c.kind).sort(), 'le mélange conserve les câbles');
-    if (shots && turn === 0) await shot(page, `${shots}-melange`);
-    await page.click('#btnReady');
-    turn += 1;
+    await g.page.waitForSelector('#members');
+    await until(async () => (await host.page.locator('#members li').count()) === i + 2, `${g.label} dans le salon`);
   }
-  await page.waitForSelector('.table');
+  return code;
 }
 
-function find(g, kinds, prefer = null) {
-  const order = [...g.players.keys()].filter((p) => p !== g.holder);
-  if (prefer != null && prefer !== g.holder) order.sort((a, b) => (a === prefer ? -1 : b === prefer ? 1 : 0));
-  for (const p of order) {
-    const slot = g.hands[p].findIndex((c) => !c.cut && kinds.includes(c.kind));
-    if (slot >= 0) return [p, slot];
+// ── consultations
+
+async function doRoles(phones, host, { badge = 'blue', shots = null } = {}) {
+  const st = await hostState(host);
+  for (const [k, p] of phones.entries()) {
+    const seat = st.members.findIndex((m) => m.id === p.id);
+    const role = st.game.roles[seat];
+    await p.page.waitForSelector('[data-stage="role"] #btnReveal');
+    assert.equal(await p.page.locator('.rolecard:not(.back)').count(), 0, 'le rôle n\'est pas affiché avant d\'être demandé');
+    assert.ok(await p.page.locator('#btnDone').isDisabled(), 'impossible de confirmer sans avoir vu sa carte');
+    await p.page.click('#btnReveal');
+    assert.equal(await text(p.page, '.rolecard .rc-name'), ROLE_NAME[role.role], `${p.label} voit son propre rôle`);
+    if (await p.page.locator('.badge-pick').count()) {
+      assert.equal(role.team, 'solo');
+      assert.ok(await p.page.locator('#btnDone').isDisabled(), 'l\'Électron libre choisit d\'abord un badge');
+      if (shots) await shot(p, `${shots}-role-electron-libre`);
+      await p.page.click(`.badge-pick.${badge}`);
+      await until(async () => !(await p.page.locator('#btnDone').isDisabled()), 'badge enregistré');
+    } else if (shots && k === 0) await shot(p, `${shots}-role`);
+    await p.page.click('#btnDone');
+    // le dernier à confirmer passe directement à ses câbles
+    await p.page.waitForSelector('#waitList, [data-stage="wires"]');
+    if (await p.page.locator('#waitList').count()) {
+      if (shots && k === 0) await shot(p, `${shots}-attente`);
+      await assertPublic(p, 'attente des autres');
+    }
+  }
+  await until(() => phaseIs(host, 'inspect'), 'tout le monde a vu son rôle');
+}
+
+async function doInspect(phones, host, { shots = null } = {}) {
+  const st = await hostState(host);
+  for (const [k, p] of phones.entries()) {
+    const seat = st.members.findIndex((m) => m.id === p.id);
+    const hand = st.game.hands[seat].map((c) => c.kind);
+    await p.page.waitForSelector('[data-stage="wires"] #btnReveal');
+    assert.equal(await p.page.locator('.wfront').count(), 0, 'aucun câble visible avant la demande');
+    await p.page.click('#btnReveal');
+    assert.equal(await p.page.locator('#myWires .wfront').count(), hand.length);
+    const summary = await text(p.page, '#handSummary');
+    const n = (k2) => hand.filter((x) => x === k2).length;
+    assert.ok(summary.includes(`${n('bypass')} dérivation`) && summary.includes(`${n('inert')} câble`), `câbles de ${p.label} : ${summary}`);
+    assert.equal(summary.includes('Surcharge'), n('overload') === 1);
+    if (st.settings.comp.badges === 'neighbor') {
+      const right = (seat - 1 + st.members.length) % st.members.length;
+      const line = await text(p.page, '#neighborBadge');
+      assert.ok(line.includes(st.members[right].name) && line.includes(st.game.roles[right].badge === 'blue' ? 'bleu' : 'orange'), `badge du voisin : ${line}`);
+    }
+    if (shots && k === 0) await shot(p, `${shots}-cables`);
+    await p.page.click('#btnMix');
+    await until(async () => (await p.page.locator('#waitList, .table').count()) > 0, `${p.label} a mélangé`);
+    assert.equal(await p.page.locator('.wfront').count(), 0, 'plus aucun câble visible après le mélange');
+  }
+  // un joueur hors ligne bloque la table : l'hôte continue sans l'attendre
+  await until(async () => {
+    if (await phaseIs(host, 'play')) return true;
+    const force = host.page.locator('[data-force]');
+    if (await force.count()) await force.first().click().catch(() => {});
+    return false;
+  }, 'tout le monde a mélangé', 25000);
+  for (const p of phones) await p.page.waitForSelector('.table');
+}
+
+// ── coupes
+
+/** Coupe qui ne termine pas la partie (si possible). */
+function quiet(g) {
+  const all = [];
+  g.hands.forEach((h, p) => { if (p !== g.holder) h.forEach((c, s) => { if (!c.cut) all.push([p, s, c.kind]); }); });
+  return all.find((x) => x[2] === 'inert') || (g.found < g.n - 1 && all.find((x) => x[2] === 'bypass')) || all[0];
+}
+function find(g, kind) {
+  for (const [p, h] of g.hands.entries()) {
+    if (p === g.holder) continue;
+    const s = h.findIndex((c) => !c.cut && c.kind === kind);
+    if (s >= 0) return [p, s, kind];
   }
   return null;
 }
-/** Coupe qui ne termine pas la partie. */
-const quiet = (g, prefer) => find(g, ['inert'], prefer) || (g.found < g.n - 1 ? find(g, ['bypass'], prefer) : null);
 
-async function cutWire(page, [target, slot], { shots = null } = {}) {
-  const before = await game(page);
+async function dismiss(page) {
+  if (await page.locator('#reveal.shown #btnContinue').count()) await page.click('#reveal #btnContinue').catch(() => {});
+}
+
+async function cutWire(phones, host, [target, slot], { by = null, shots = null } = {}) {
+  const st = await hostState(host);
+  const g = st.game;
+  const cutter = by || phoneOf(phones, st.members[g.holder].id);
+  const page = cutter.page;
+  await dismiss(page);
+  await page.waitForSelector('.table');
   await page.click(`.seat[data-seat="${target}"]`);
   await page.waitForSelector('#targetWires');
   assert.ok(await page.locator('#btnCut').isDisabled(), 'pas de coupe sans sélection');
-  // on change d'avis une fois : la sélection se corrige avant la coupe
-  const other = before.hands[target].findIndex((c, i) => !c.cut && i !== slot);
-  if (other >= 0) {
-    await page.click(`#targetWires .slot[data-slot="${other}"]`);
-    assert.equal(await page.locator('#targetWires .slot.sel').count(), 1);
-  }
+  const other = g.hands[target].findIndex((c, i) => !c.cut && i !== slot);
+  if (other >= 0) await page.click(`#targetWires .slot[data-slot="${other}"]`); // on change d'avis une fois
   await page.click(`#targetWires .slot[data-slot="${slot}"]`);
-  assert.equal(await page.locator('#targetWires .slot.sel').getAttribute('data-slot'), String(slot));
-  assert.equal(await page.locator('#targetWires .wfront').count(), before.hands[target].filter((c) => c.cut).length, 'seuls les câbles déjà coupés montrent leur face');
-  if (shots) await shot(page, `${shots}-choix`);
+  // les autres téléphones voient ce que vise le porteur de la pince
+  const watcher = phones.find((p) => p !== cutter && phoneOf(phones, p.id));
+  await until(async () => (await watcher.page.locator(`.seat.aimed[data-seat="${target}"] .mini.aim`).count()) === 1, 'visée visible des autres');
+  if (shots) { await shot(cutter, `${shots}-choix`); await shot(watcher, `${shots}-visee-vue-par-un-autre`); }
   await page.click('#btnCut');
-  await page.waitForSelector('#reveal.shown');
-  const after = await game(page);
-  const kind = before.hands[target][slot].kind;
-  assert.deepEqual(after.log.at(-1), { round: before.round, by: before.holder, from: target, kind });
+  await until(async () => (await hostState(host)).game.log.length === g.log.length + 1, 'coupe appliquée');
+  const after = (await hostState(host)).game;
+  assert.deepEqual(after.log.at(-1), { round: g.round, by: g.holder, from: target, kind: g.hands[target][slot].kind });
   assert.equal(after.holder, target, 'la pince passe au joueur coupé');
-  const title = await text(page, '#revealTitle');
-  assert.ok({ inert: /inerte/i, bypass: /Dérivation/, overload: /Surcharge/ }[kind].test(title), `révélation : ${title}`);
-  if (shots) await shot(page, `${shots}-revelation-${kind}`);
-  await page.click('#btnContinue');
-  await page.waitForSelector('#reveal', { state: 'detached' });
   return after;
 }
 
-async function checkTable(page, where = 'table') {
-  const g = await game(page);
-  await assertPublic(page, where, { badges: g.comp.badges === 'public' });
-  assert.equal(await text(page, '#holderName'), g.players[g.holder].name);
-  assert.equal(await page.locator('.seat.holder').getAttribute('data-seat'), String(g.holder), 'la pince est affichée chez le bon joueur');
-  assert.equal(await page.locator('.seat').count(), g.n);
-  assert.equal(await page.locator('.mini.cut').count(), g.cuts);
-  assert.equal(await page.locator('.mini:not(.cut)').count(), g.hands.flat().filter((c) => !c.cut).length);
-  assert.ok((await text(page, '#hudRound')).includes(`${g.round}/4`));
-  assert.ok((await text(page, '#hudCuts')).includes(`${g.cuts}/${g.n}`));
-  assert.ok((await text(page, '#hudFound')).includes(`${g.found}/${g.n}`));
-  // rien ne déborde de l'écran
-  const fit = await page.evaluate(() => ({ w: document.documentElement.scrollWidth <= innerWidth, h: document.querySelector('.table').getBoundingClientRect().height <= innerHeight + 1 }));
-  assert.deepEqual(fit, { w: true, h: true }, 'la table tient dans l\'écran');
-  const small = await page.evaluate(() => [...document.querySelectorAll('.seat, .icon-btn, .turnbar .btn')].filter((el) => { const r = el.getBoundingClientRect(); return r.width < 44 || r.height < 44; }).length);
-  assert.equal(small, 0, 'toutes les cibles tactiles font au moins 44 px');
-  return g;
+/** Vérifie la table sur chaque téléphone. */
+async function checkTables(phones, host) {
+  const st = await hostState(host);
+  const g = st.game;
+  for (const p of phones) {
+    const page = p.page;
+    await until(async () => (await page.locator('.mini.cut').count()) === g.cuts && (await page.locator(`.seat.holder[data-seat="${g.holder}"]`).count()) === 1, `table à jour chez ${p.label}`);
+    await assertPublic(p, 'table');
+    const mine = st.members[g.holder].id === p.id;
+    assert.equal((await text(page, '#holderName')) === 'À toi', mine, `${p.label} sait si c'est son tour`);
+    assert.ok((await text(page, '#hudFound')).includes(`${g.found}/${g.n}`));
+    const me = st.members.findIndex((m) => m.id === p.id);
+    assert.equal(await page.locator(`.seat.me[data-seat="${me}"]`).count(), 1, 'sa place est repérée');
+    const fit = await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth && document.querySelector('.table').getBoundingClientRect().height <= innerHeight + 1);
+    assert.ok(fit, `la table tient dans l'écran de ${p.label}`);
+  }
 }
 
-async function nextRound(page, { shots = null } = {}) {
-  await page.waitForSelector('#btnDeal');
-  const g = await game(page);
-  await assertPublic(page, 'fin de manche');
-  assert.ok((await text(page, '#roundEndTitle')).includes(`Manche ${g.round}`));
-  assert.equal(await text(page, '#reFound'), `${g.found}/${g.n}`);
-  assert.equal(await text(page, '#reHidden'), String(g.hands.flat().filter((c) => !c.cut).length));
-  assert.equal(await text(page, '#nextStarter'), g.players[g.holder].name, 'le dernier joueur coupé commence la manche suivante');
-  if (shots) await shot(page, `${shots}-fin-de-manche`);
-  await page.click('#btnDeal');
-  await page.waitForSelector('#handoffName');
-  const after = await game(page);
-  assert.equal(after.round, g.round + 1);
-  assert.ok(after.hands.every((h) => h.length === 5 - g.round), 'un câble de moins par joueur');
-  assert.equal(await text(page, '#handoffName'), g.players[g.holder].name);
+async function nextRound(phones, host, { shots = null } = {}) {
+  const st = await hostState(host);
+  for (const p of phones) {
+    await dismiss(p.page);
+    await p.page.waitForSelector('#btnDeal');
+    await assertPublic(p, 'fin de manche');
+    const starter = await text(p.page, '#nextStarter');
+    assert.equal(starter, st.members[st.game.holder].id === p.id ? 'Tu' : st.members[st.game.holder].name);
+  }
+  if (shots) await shot(phones[1], `${shots}-fin-de-manche`);
+  await phones.at(-1).page.click('#btnDeal'); // n'importe quel joueur
+  await until(() => phaseIs(host, 'inspect'), 'redistribution');
+  const g = (await hostState(host)).game;
+  assert.ok(g.hands.every((h) => h.length === 5 - st.game.round), 'un câble de moins par joueur');
+}
+
+/** Joue jusqu'à la fin ; `choose(g)` donne la coupe à faire. */
+async function playOut(phones, host, choose, { shots = null } = {}) {
+  for (let guard = 0; guard < 80; guard++) {
+    const st = await hostState(host);
+    const g = st.game;
+    if (g.phase === 'over') return st;
+    if (g.phase === 'roundEnd') {
+      await nextRound(phones, host, { shots: guard < 12 ? shots : null });
+      await doInspect(phones.filter((p) => !p.gone), host);
+      continue;
+    }
+    // si le porteur de la pince n'a plus de téléphone, l'hôte coupe à sa place
+    const holderId = st.members[g.holder].id;
+    await cutWire(phones, host, choose(g), { by: holderId === host.id || !phoneOf(phones, holderId) ? host : null });
+  }
+  throw new Error('partie sans fin');
 }
 
 async function scenario(name, fn) {
-  if (ONLY && !ONLY.includes(name)) return;
+  if (ONLY && !ONLY.some((o) => name.startsWith(o))) return;
   const t = Date.now();
   await fn();
   done.push(`${name} (${((Date.now() - t) / 1000).toFixed(1)} s)`);
   console.log(`✓ ${name}`);
 }
 
-const IPHONE_UA = devices['iPhone 13'].userAgent;
-const view = (width, height) => ({ viewport: { width, height }, deviceScaleFactor: SCALE, isMobile: true, hasTouch: true, userAgent: IPHONE_UA });
-
 // ───────────────────────────────────────────── scénarios
 
-await scenario('classique-5-joueurs-victoire-techniciens', async () => {
-  const { page, context } = await phone('iPhone 13', { ...devices['iPhone 13'] }, { seed: 11 });
-  await shot(page, 'a-accueil');
-  await page.click('#btnRules');
-  await page.waitForSelector('.rules');
-  await page.click('.topbar .icon-btn');
-  await setup(page, { n: 5, names: ['Léa', 'Tom', 'Inès', 'Noé', 'Jade'], first: 2 });
-  await shot(page, 'a-configuration');
-  await launch(page);
-  let g = await game(page);
-  assert.deepEqual([g.n, g.comp.tech, g.comp.sab, g.undealt.length, g.holder], [5, 3, 2, 0, 2]);
+await scenario('classique-5-joueurs : partie complète, rechargements, rejouer', async () => {
+  const host = await phone('Léa');
+  const guests = [await phone('Tom'), await phone('Inès', devices['Pixel 7']), await phone('Noé'), await phone('Jade')];
+  const all = [host, ...guests];
+  const code = await createTable(host, guests);
+  const sp = spy(code);
+  // l'hôte range la table : Jade passe avant Noé, et c'est Inès qui commence
+  await host.page.click(`.member[data-id="${guests[3].id}"] [aria-label^="Monter"]`);
+  await until(async () => (await guests[0].page.locator('#members li .m-name').allTextContents()).map((s) => s.replace(/hôte|toi|hors ligne/gi, '').trim()).join() === 'Léa,Tom,Inès,Jade,Noé', 'ordre diffusé');
+  await host.page.click(`#firstPick [data-first="${guests[1].id}"]`);
+  await until(async () => (await guests[0].page.locator('.comp-row.ro').last().textContent()).includes('Inès'), 'premier joueur diffusé');
+  assert.equal(await guests[0].page.locator('#btnLaunch').count(), 0, 'seul l\'hôte peut lancer');
+  await host.page.click('#btnLaunch');
 
-  await passRoles(page, {
-    shots: 'a',
-    onSecond: async (p2, state, p) => {
-      // actualisation pendant une consultation privée : retour à l'écran neutre du même joueur
-      await p2.click('#btnReveal');
-      assert.equal(await p2.locator('.rolecard:not(.back)').count(), 1);
-      await p2.reload();
-      await p2.waitForFunction(() => window.__ccReady === true);
-      assert.equal(await text(p2, '#handoffName'), state.players[p].name);
-      await assertPublic(p2, 'reprise après actualisation');
-      // passage en arrière-plan : l'écran privé disparaît
-      await p2.click('#btnIam');
-      await p2.click('#btnReveal');
-      await p2.evaluate(() => { Object.defineProperty(document, 'hidden', { configurable: true, get: () => true }); document.dispatchEvent(new Event('visibilitychange')); });
-      await p2.waitForSelector('#btnIam');
-      await assertPublic(p2, 'retour d\'arrière-plan');
-      await p2.evaluate(() => { delete document.hidden; });
-      // geste « retour » : on reste dans l'appli, sur l'écran neutre
-      await p2.click('#btnIam');
-      await p2.click('#btnReveal');
-      await p2.goBack().catch(() => {});
-      await p2.waitForTimeout(200);
-      assert.ok(p2.url().startsWith(URL_.split('?')[0]), 'le retour ne quitte pas l\'application');
-      await p2.click('#btnHide');
-    },
-  });
-  await passInspect(page, { shots: 'a' });
-  g = await checkTable(page);
-  assert.equal(g.holder, 2, 'le premier joueur choisi tient la pince');
-  await shot(page, 'a-table');
+  await doRoles(all, host);
+  // un joueur recharge pendant la consultation de ses câbles : rien n'est révélé d'office
+  await guests[0].page.waitForSelector('[data-stage="wires"]');
+  await guests[0].page.click('#btnReveal');
+  await reload(guests[0]);
+  await guests[0].page.waitForSelector('[data-stage="wires"] #btnReveal');
+  assert.equal(await guests[0].page.locator('.wfront').count(), 0, 'après actualisation, les câbles sont cachés');
+  await doInspect(all, host);
+  let st = await hostState(host);
+  assert.equal(st.game.holder, 2, 'Inès commence');
+  await checkTables(all, host);
 
-  // on ne coupe pas ses propres câbles
-  await page.click(`.seat[data-seat="${g.holder}"]`);
-  assert.equal(await page.locator('#targetWires').count(), 0);
-  await page.waitForSelector('.toast');
+  // un spectateur ne peut pas couper
+  const watcher = guests[0];
+  await watcher.page.click('.seat[data-seat="3"]');
+  await watcher.page.waitForSelector('.toast');
+  assert.equal(await watcher.page.locator('#targetWires').count(), 0);
+  // le porteur de la pince ne coupe pas ses propres câbles
+  await guests[1].page.click('.seat[data-seat="2"]');
+  assert.equal(await guests[1].page.locator('#targetWires').count(), 0);
 
-  // manche 1 : rien de décisif, avec une actualisation en plein milieu
+  // manche 1, avec rechargement de l'hôte en plein milieu
   for (let i = 0; i < 5; i++) {
-    g = await game(page);
-    await cutWire(page, quiet(g), { shots: i === 0 ? 'a' : null });
+    st = await hostState(host);
+    if (st.game.phase !== 'play') break;
+    await cutWire(all, host, quiet(st.game), { by: st.members[st.game.holder].id === host.id ? host : null });
     if (i === 1) {
-      await page.reload();
-      await page.waitForFunction(() => window.__ccReady === true);
-      await page.waitForSelector('.table');
-      const again = await checkTable(page, 'table après actualisation');
-      assert.equal(again.log.length, 2, 'la partie reprend exactement où elle en était');
-      await page.click('#btnHistory');
-      await page.waitForSelector('.history .hist-row');
-      assert.equal(await page.locator('.history .hist-row').count(), 2);
-      await shot(page, 'a-historique');
-      await page.goBack().catch(() => {}); // le retour ferme la feuille, rien d'autre
-      await page.waitForSelector('.history', { state: 'detached' });
-      await page.waitForSelector('.table');
+      await reload(host);
+      await host.page.waitForSelector('.table');
+      await checkTables(all, host);
     }
-    if (i < 4) await checkTable(page);
   }
-  await nextRound(page, { shots: 'a' });
-  await passInspect(page);
-  g = await checkTable(page);
-  assert.equal(g.round, 2);
-  assert.ok(g.hands.every((h) => h.length === 4));
-
-  // les Techniciens trouvent toutes les dérivations
-  for (let guard = 0; guard < 40; guard++) {
-    g = await game(page);
-    if (g.phase === 'over') break;
-    if (g.phase === 'roundEnd') { await nextRound(page); await passInspect(page); continue; }
-    const soloOrNot = find(g, ['bypass']) || find(g, ['inert']);
-    await cutWire(page, soloOrNot, { shots: g.found === g.n - 1 && find(g, ['bypass']) ? 'a-final' : null });
+  // le rôle reste consultable à tout moment, et seulement sur son propre téléphone
+  await dismiss(guests[2].page);
+  if (await guests[2].page.locator('#btnMyRole').count()) {
+    await guests[2].page.click('#btnMyRole');
+    const s2 = await hostState(host);
+    const seat = s2.members.findIndex((m) => m.id === guests[2].id);
+    assert.equal(await text(guests[2].page, '.myrole .rc-name'), ROLE_NAME[s2.game.roles[seat].role]);
+    await guests[2].page.evaluate(() => { Object.defineProperty(document, 'hidden', { configurable: true, get: () => true }); document.dispatchEvent(new Event('visibilitychange')); });
+    await guests[2].page.waitForSelector('.myrole', { state: 'detached' });
+    await guests[2].page.evaluate(() => { delete document.hidden; });
   }
-  g = await game(page);
-  assert.deepEqual([g.phase, g.winner, g.reason], ['over', 'tech', 'bypass']);
-  await page.waitForSelector('.over.safe');
-  assert.equal(await text(page, '#overTitle'), 'Victoire des Techniciens');
-  await shot(page, 'a-victoire-techniciens');
-  assert.equal(await page.locator('#rolesReveal .role-row').count(), 0, 'les rôles ne sont révélés que sur demande');
-  await page.click('#btnRevealRoles');
-  assert.equal(await page.locator('#rolesReveal .role-row').count(), 5);
-  await shot(page, 'a-roles-reveles');
-
-  // rejouer avec les mêmes joueurs
-  await page.click('#btnReplay');
-  await page.waitForSelector('#handoffName');
-  const fresh = await game(page);
-  assert.deepEqual([fresh.phase, fresh.round, fresh.log.length, fresh.players.map((p) => p.name).join()], ['roles', 1, 0, 'Léa,Tom,Inès,Noé,Jade']);
-  await context.close();
+  st = await playOut(all, host, (g) => find(g, 'bypass') || quiet(g));
+  assert.deepEqual([st.game.winner, st.game.reason], ['tech', 'bypass']);
+  for (const p of all) {
+    await dismiss(p.page);
+    await p.page.waitForSelector('.over.safe');
+    assert.equal(await text(p.page, '#overTitle'), 'Victoire des Techniciens');
+  }
+  await guests[0].page.click('#btnRevealRoles');
+  assert.equal(await guests[0].page.locator('#rolesReveal .role-row').count(), 5);
+  assertSealed(sp.seen);
+  sp.end();
+  // rejouer avec la même table
+  assert.equal(await guests[0].page.locator('#btnReplay').count(), 0);
+  await host.page.click('#btnReplay');
+  for (const p of all) await p.page.waitForSelector('[data-stage="role"]');
+  for (const p of all) await p.context.close();
 });
 
-await scenario('infiltration-6-joueurs-victoire-electron-libre', async () => {
-  const { page, context } = await phone('Pixel 7', { ...devices['Pixel 7'] }, { seed: 23 });
-  await setup(page, { n: 6, names: ['Ana', 'Ben', 'Chloé', 'Dov', 'Emma', 'Farid'], mode: 'infiltration', first: 'random' });
-  await page.locator('#modeHelp').scrollIntoViewIfNeeded();
-  await shot(page, 'b-configuration-infiltration');
-  await page.click('.acc[data-doc="solo"] summary');
-  await page.locator('.acc[data-doc="solo"]').scrollIntoViewIfNeeded();
-  await shot(page, 'b-fiche-role');
-  await page.click('.comp-row.c-solo .info-btn');
-  await page.waitForSelector('.sheet.open .doc');
-  await shot(page, 'b-fiche-role-feuille');
-  await page.click('.sheet .icon-btn');
-  await page.waitForSelector('.sheet', { state: 'detached' });
-  await launch(page);
-  let g = await game(page);
-  assert.deepEqual([g.comp.tech, g.comp.sab, g.comp.solo, g.comp.badges, g.undealt.length], [3, 2, 1, 'neighbor', 0]);
-  assert.equal(g.roles.filter((r) => r.role === 'mole').length, 1);
-  assert.equal(g.roles.filter((r) => r.role === 'infiltrator').length, 1);
-  const solo = g.roles.findIndex((r) => r.team === 'solo');
+await scenario('infiltration-6-joueurs : Électron libre, joueur déconnecté, retour au salon', async () => {
+  const host = await phone('Ana', sized(375, 667));
+  const guests = [await phone('Ben'), await phone('Chloé', devices['Pixel 7']), await phone('Dov'), await phone('Emma', sized(360, 640, devices['Pixel 7'].userAgent)), await phone('Farid')];
+  const all = [host, ...guests];
+  await createTable(host, guests, { invite: 2 });
+  await host.page.click('#modePick button[data-v="infiltration"]');
+  await until(async () => (await text(guests[0].page, '#modeName')) === 'Infiltration', 'mode diffusé');
+  await host.page.click('#btnLaunch');
+  await doRoles(all, host, { badge: 'orange' });
+  let st = await hostState(host);
+  const solo = st.game.roles.findIndex((r) => r.team === 'solo');
+  assert.equal(st.game.roles[solo].badge, 'orange');
+  await doInspect(all, host);
+  await checkTables(all, host);
 
-  await passRoles(page, { badge: 'orange', shots: 'b' });
-  assert.equal((await game(page)).roles[solo].badge, 'orange');
-  await passInspect(page, { shots: 'b' });
-  await checkTable(page);
-  await shot(page, 'b-table');
-
-  // l'Électron libre doit couper lui-même le câble final : on lui amène la pince, puis il coupe la Surcharge
-  for (let guard = 0; guard < 60; guard++) {
-    g = await game(page);
-    if (g.phase === 'over') break;
-    if (g.phase === 'roundEnd') { await nextRound(page); await passInspect(page); continue; }
-    if (g.holder === solo && find(g, ['overload'])) { await cutWire(page, find(g, ['overload']), { shots: 'b' }); continue; }
-    await cutWire(page, quiet(g, solo));
+  // un joueur perd la connexion : la table l'affiche, l'hôte coupe à sa place quand il tient la pince
+  const lost = guests.find((g) => g.id !== st.members[solo].id && g.id !== st.members[st.game.holder].id);
+  const lostSeat = st.members.findIndex((m) => m.id === lost.id);
+  await lost.context.close();
+  lost.gone = true;
+  const live = all.filter((p) => !p.gone);
+  await until(async () => (await host.page.locator(`.seat.off[data-seat="${lostSeat}"]`).count()) === 1, 'joueur vu hors ligne', 25000);
+  st = await hostState(host);
+  if (st.game.holder !== lostSeat) {
+    const slot = st.game.hands[lostSeat].findIndex((c) => !c.cut && c.kind === 'inert');
+    await cutWire(live, host, [lostSeat, slot], { by: st.members[st.game.holder].id === host.id ? host : null });
   }
-  g = await game(page);
-  assert.deepEqual([g.phase, g.winner, g.reason, g.endedBy], ['over', 'solo', 'overload', solo]);
-  await page.waitForSelector('.over.solo');
-  assert.ok((await text(page, '#overTitle')).includes(g.players[solo].name));
-  await shot(page, 'b-victoire-electron-libre');
-  await page.click('#btnRevealRoles');
-  assert.equal(await page.locator('#rolesReveal .role-row').count(), 6);
-  await context.close();
+  await dismiss(host.page);
+  await until(async () => (await text(host.page, '.turnbar')).includes('hors ligne'), 'l\'hôte voit qu\'il peut jouer à sa place');
+  st = await hostState(host);
+  await cutWire(live, host, quiet(st.game), { by: host });
+
+  st = await playOut(live, host, quiet);
+  assert.equal(st.game.phase, 'over');
+  for (const p of live) { await dismiss(p.page); await p.page.waitForSelector('.over'); }
+  await host.page.click('#btnBackLobby');
+  for (const p of live) await p.page.waitForSelector('#members');
+  assert.equal(await host.page.locator('.member.off').count(), 1, 'le joueur parti apparaît hors ligne dans le salon');
+  // l'hôte retire le joueur absent puis ferme la partie
+  await host.page.click(`.member[data-id="${lost.id}"] [aria-label^="Retirer"]`);
+  await host.page.click('.confirm .btn.danger');
+  await until(async () => (await host.page.locator('#members li').count()) === 5, 'joueur retiré');
+  await host.page.click('#btnLeaveLobby');
+  await host.page.click('.confirm .btn.danger');
+  for (const p of live) await p.page.waitForSelector('#btnCreate, #btnJoinInvite');
+  for (const p of live) await p.context.close();
 });
 
-await scenario('perso-4-joueurs-badges-publics-surcharge', async () => {
-  const { page, context } = await phone('iPhone SE', view(375, 667), { seed: 5 });
-  await setup(page, {
-    n: 4, names: ['Zoé', 'Yan', 'Zoé', 'Wim'], mode: 'custom',
-    tweak: async (p) => {
-      // trop peu de cartes : lancement impossible
-      await p.click('.comp-row.c-tech .step:first-child');
-      await p.click('.comp-row.c-tech .step:first-child');
-      await p.click('.comp-row.c-sab .step:first-child');
-      assert.equal(await text(p, '#count-tech'), '1');
-      assert.ok((await text(p, '#compSummary')).includes('Il manque 2 cartes'));
-      assert.ok(await p.locator('#btnLaunch').isDisabled());
-      await shot(p, 'c-configuration-invalide');
-      for (let i = 0; i < 2; i++) await p.click('.comp-row.c-tech .step:last-child');
-      await p.click('.comp-row.c-sab .step:last-child');
-      // un agent double active les badges tout seul
-      await p.locator('#sw-mole').check();
-      assert.equal(await p.locator('#badgePick button.sel').getAttribute('data-v'), 'neighbor');
-      await p.click('#badgePick button[data-v="public"]');
-      assert.ok((await text(p, '#compSummary')).includes('5 cartes Rôle pour 4 joueurs'));
-      assert.equal(await p.locator('#modePick button.sel').getAttribute('data-v'), 'custom');
-    },
-  });
-  // deux joueurs portent le même prénom : refusé
-  await page.click('#btnLaunch');
-  await page.waitForSelector('.toast.warn');
-  assert.equal(await page.locator('#handoffName').count(), 0);
-  await page.locator('.name-input').nth(2).fill('Xu');
-  await page.locator('.name-input').nth(2).blur();
-  // changement d'ordre autour de la table
-  await page.click('.name-row:nth-child(4) .icon-btn[aria-label^="Monter"]');
-  assert.deepEqual(await page.locator('.name-input').evaluateAll((els) => els.map((e) => e.value)), ['Zoé', 'Yan', 'Wim', 'Xu']);
-  await page.click('#firstPick [data-first="3"]');
-  await launch(page);
-  let g = await game(page);
-  assert.deepEqual([g.players.map((p) => p.name).join(), g.holder, g.undealt.length, g.comp.badges], ['Zoé,Yan,Wim,Xu', 3, 1, 'public']);
-
-  await passRoles(page);
-  await passInspect(page);
-  g = await checkTable(page);
-  // badges publics : un par joueur, à la bonne couleur
-  for (let i = 0; i < g.n; i++) {
-    assert.ok(await page.locator(`.seat[data-seat="${i}"] .bdot.${g.roles[i].badge}`).count(), `badge du joueur ${i}`);
-  }
-  await shot(page, 'c-table-badges-publics');
-  for (let guard = 0; guard < 30; guard++) {
-    g = await game(page);
-    if (g.phase === 'over') break;
-    if (g.phase === 'roundEnd') { await nextRound(page); await passInspect(page); continue; }
-    await cutWire(page, find(g, ['overload']) || quiet(g), { shots: find(g, ['overload']) ? 'c' : null });
-  }
-  g = await game(page);
-  assert.deepEqual([g.phase, g.winner, g.reason], ['over', 'sab', 'overload']);
-  await page.waitForSelector('.over.boom');
-  assert.equal(await text(page, '#overTitle'), 'Victoire des Saboteurs');
-  await shot(page, 'c-victoire-saboteurs');
-  await page.click('#btnRevealRoles');
-  assert.equal(await page.locator('#rolesReveal .role-row').count(), 5, '4 joueurs + 1 carte non distribuée');
-  assert.equal(await page.locator('#rolesReveal .role-row.undealt').count(), 1);
-  await page.click('#btnHome');
-  await page.waitForSelector('#btnNew');
-  assert.equal(await page.locator('#btnResume').count(), 0);
-  await context.close();
-});
-
-await scenario('classique-8-joueurs-petit-ecran-temps-ecoule', async () => {
-  const { page, context } = await phone('Android 360×640', { ...view(360, 640), userAgent: devices['Pixel 7'].userAgent }, { seed: 4 });
-  // animations coupées depuis l'accueil
-  await page.click('.toggles .icon-btn[title="Animations"]');
-  assert.ok(await page.evaluate(() => document.documentElement.classList.contains('reduced')));
-  await page.click('.toggles .icon-btn[title="Sons"]');
-  await setup(page, { n: 8, names: ['Alix', 'Basile', 'Capucine', 'Dorian', 'Élodie', 'Félix', 'Gabrielle', 'Hippolyte'] });
-  await shot(page, 'd-configuration-8');
-  await launch(page);
-  let g = await game(page);
-  assert.deepEqual([g.n, g.comp.tech, g.comp.sab, g.undealt.length], [8, 5, 3, 0]);
-  await passRoles(page);
-  await passInspect(page, { shots: 'd' });
-  await checkTable(page);
-  await shot(page, 'd-table-8');
-  for (let guard = 0; guard < 80; guard++) {
-    g = await game(page);
-    if (g.phase === 'over') break;
-    if (g.phase === 'roundEnd') { await nextRound(page); await passInspect(page); await checkTable(page); continue; }
-    const c = quiet(g);
-    assert.ok(c, 'une coupe neutre est disponible (sinon changer la graine du scénario)');
-    await cutWire(page, c);
-  }
-  g = await game(page);
-  assert.deepEqual([g.phase, g.winner, g.reason, g.round, g.log.length], ['over', 'sab', 'timeout', 4, 32]);
-  await page.waitForSelector('.over.boom');
-  await shot(page, 'd-temps-ecoule');
-  // le menu : abandon avec confirmation
-  await page.click('#btnNewSetup');
-  await page.waitForSelector('#countPick');
-  assert.equal(await page.locator('.name-input').first().inputValue(), 'Alix', 'les prénoms sont conservés');
-  await context.close();
-});
-
-await scenario('hors-ligne', async () => {
-  const { page, context } = await phone('iPhone 15 Pro Max', view(430, 932), { seed: 9 });
-  await page.evaluate(() => navigator.serviceWorker.ready);
-  await page.waitForFunction(() => navigator.serviceWorker.controller !== null || navigator.serviceWorker.ready.then(() => true));
-  await page.reload(); // la page est désormais servie par le service worker
-  await page.waitForFunction(() => window.__ccReady === true && !!navigator.serviceWorker.controller);
-  await context.setOffline(true);
-  await page.reload();
-  await page.waitForFunction(() => window.__ccReady === true);
-  await shot(page, 'e-accueil-hors-ligne');
-  await setup(page, { n: 7, names: ['Un', 'Deux', 'Trois', 'Quatre', 'Cinq', 'Six', 'Sept'], mode: 'infiltration' });
-  await launch(page);
-  let g = await game(page);
-  assert.equal(g.undealt.length, 0);
-  await passRoles(page);
-  await passInspect(page);
-  await checkTable(page);
-  await shot(page, 'e-table-7-hors-ligne');
-  for (let i = 0; i < 3; i++) { g = await game(page); await cutWire(page, quiet(g)); }
-  await page.reload(); // toujours sans réseau
-  await page.waitForFunction(() => window.__ccReady === true);
-  await page.waitForSelector('.table');
-  g = await checkTable(page, 'table après actualisation hors ligne');
-  assert.equal(g.log.length, 3);
-  // abandon de la partie depuis le menu, avec confirmation
-  await page.click('#btnMenu');
-  await page.click('#menuQuit');
-  await page.click('.confirm .btn.ghost');
-  await page.waitForTimeout(350);
-  assert.ok((await game(page)) !== null, 'annuler ne supprime rien');
-  await page.click('#menuQuit');
-  await page.click('.confirm .btn.danger');
-  await page.waitForSelector('#btnNew');
-  assert.equal(await game(page), null);
-  await context.close();
-});
-
-await scenario('encoche-et-barre-d-accueil', async () => {
-  // Playwright n'émule pas les zones de sécurité : on les simule pour vérifier que rien ne passe dessous.
-  const css = ':root{--safe-t:59px;--safe-b:34px}';
-  const { page, context } = await phone('iPhone 15', view(393, 852), { seed: 3, css });
-  await shot(page, 'f-accueil-encoche');
-  await setup(page, { n: 6, names: ['Ana', 'Ben', 'Chloé', 'Dov', 'Emma', 'Farid'] });
-  await launch(page);
-  await passRoles(page);
-  await passInspect(page);
-  await page.addStyleTag({ content: css });
-  await checkTable(page);
-  const box = await page.evaluate(() => { const hud = document.querySelector('.hud').getBoundingClientRect(); const bar = document.querySelector('.turnbar').getBoundingClientRect(); return { top: hud.top, bottom: innerHeight - bar.bottom }; });
-  assert.ok(box.top >= 59 && box.bottom >= 34, `zones de sécurité respectées (${JSON.stringify(box)})`);
-  await shot(page, 'f-table-encoche');
-  await context.close();
+await scenario('captures : 4 joueurs, animations, petits écrans', async () => {
+  const host = await phone('Zoé', sized(375, 667), { motion: true });
+  const guests = [await phone('Yan', IPHONE, { motion: true }), await phone('Xu', sized(360, 640, devices['Pixel 7'].userAgent), { motion: true }), await phone('Wim', sized(430, 932), { motion: true })];
+  const all = [host, ...guests];
+  await shot(host, 'z-accueil');
+  await guests[0].page.goto(`${APP}&room=ABCDE`);
+  await guests[0].page.waitForFunction(() => window.__ccReady === true);
+  await shot(guests[0], 'z-accueil-invitation');
+  await guests[0].page.goto(APP);
+  await guests[0].page.waitForFunction(() => window.__ccReady === true);
+  await createTable(host, guests, { invite: 0 });
+  await host.page.click('#modePick button[data-v="infiltration"]');
+  await until(async () => (await text(guests[0].page, '#modeName')) === 'Infiltration', 'mode diffusé');
+  await shot(host, 'z-salon-hote');
+  await shot(guests[0], 'z-salon-joueur');
+  await host.page.click('#btnLaunch');
+  await doRoles(all, host, { shots: 'z' });
+  await doInspect(all, host, { shots: 'z' });
+  await checkTables(all, host);
+  let st = await hostState(host);
+  const holder = phoneOf(all, st.members[st.game.holder].id);
+  const other = all.find((p) => p !== holder);
+  await shot(holder, 'z-table-a-toi');
+  await shot(other, 'z-table-spectateur');
+  await cutWire(all, host, quiet(st.game), { shots: 'z' });
+  await other.page.waitForSelector('#reveal.shown');
+  await shot(other, 'z-revelation');
+  st = await playOut(all, host, (g) => find(g, 'overload') && g.round >= 2 ? find(g, 'overload') : quiet(g), { shots: 'z' });
+  for (const p of all) { await dismiss(p.page); await p.page.waitForSelector('.over'); }
+  await host.page.waitForTimeout(1200);
+  await shot(host, `z-fin-${st.game.winner}`);
+  await guests[2].page.click('#btnRevealRoles');
+  await shot(guests[2], 'z-fin-roles');
+  for (const p of all) await p.context.close();
 });
 
 // ───────────────────────────────────────────── bilan
 
 await browser.close();
-if (server) server.close();
+web.server.close();
+await relay.close();
 if (errors.length) {
-  console.error(`\n✗ Erreurs dans la page :\n  ${[...new Set(errors)].join('\n  ')}`);
+  console.error(`\n✗ Erreurs dans les pages :\n  ${[...new Set(errors)].join('\n  ')}`);
   process.exit(1);
 }
 console.log(`\n✓ ${done.length} scénarios de bout en bout réussis :\n  ${done.join('\n  ')}\n  Captures : ${OUT}`);

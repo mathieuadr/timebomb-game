@@ -4,7 +4,7 @@
 
 import { HAND_SIZE, ROUNDS, WIRE, TEAM, BADGE, BADGES, roleDeck, wireDeck, validateComposition, handSize } from './rules.js';
 
-export const STATE_VERSION = 1;
+export const STATE_VERSION = 2;
 
 export class RuleError extends Error {
   constructor(code, message) {
@@ -33,9 +33,6 @@ function dealHands(kinds, n, size) {
   return hands;
 }
 
-/** Joueur qui tient le téléphone pendant une phase « on se passe le téléphone ». */
-export const passPlayer = (state) => (state.holder + state.pass) % state.n;
-
 export function createGame({ names, comp, firstPlayer = 0 }, rng = Math.random) {
   const n = Array.isArray(names) ? names.length : 0;
   const check = validateComposition(comp, n);
@@ -57,44 +54,54 @@ export function createGame({ names, comp, firstPlayer = 0 }, rng = Math.random) 
     firstPlayer,
     log: [],
     phase: 'roles', // roles → inspect → play → roundEnd → inspect → … → over
-    pass: 0,
+    ready: Array(n).fill(false), // qui a fini de consulter ses secrets (rôle, puis câbles)
     winner: null,
     reason: null,
     endedBy: null,
   };
 }
 
+const assertSeat = (state, player) => {
+  if (!Number.isInteger(player) || player < 0 || player >= state.n) throw new RuleError('bad-player');
+};
+
 /** L'Électron libre choisit le badge qu'il montrera. */
-export function chooseBadge(state, badge) {
+export function chooseBadge(state, player, badge) {
   if (state.phase !== 'roles') throw new RuleError('not-roles');
+  assertSeat(state, player);
   if (state.comp.badges === BADGES.OFF) throw new RuleError('badges-off');
   if (badge !== BADGE.BLUE && badge !== BADGE.ORANGE) throw new RuleError('bad-badge');
-  const p = passPlayer(state);
-  if (state.roles[p].team !== TEAM.SOLO) throw new RuleError('not-solo');
+  if (state.roles[player].team !== TEAM.SOLO) throw new RuleError('not-solo');
+  if (state.ready[player]) throw new RuleError('already-ready');
   const s = clone(state);
-  s.roles[p].badge = badge;
+  s.roles[player].badge = badge;
   return s;
 }
 
-/** Le joueur courant a vu son rôle et masque l'écran. */
-export function ackRole(state) {
+const allReady = (s) => s.ready.every(Boolean);
+
+/** Un joueur a vu son rôle. Quand tout le monde l'a vu, on passe à la consultation des câbles. */
+export function ackRole(state, player) {
   if (state.phase !== 'roles') throw new RuleError('not-roles');
-  const role = state.roles[passPlayer(state)];
+  assertSeat(state, player);
+  if (state.ready[player]) return state; // déjà fait : sans effet (message reçu deux fois)
+  const role = state.roles[player];
   if (role.team === TEAM.SOLO && state.comp.badges !== BADGES.OFF && !role.badge) throw new RuleError('badge-required');
   const s = clone(state);
-  s.pass += 1;
-  if (s.pass === s.n) { s.phase = 'inspect'; s.pass = 0; }
+  s.ready[player] = true;
+  if (allReady(s)) { s.phase = 'inspect'; s.ready.fill(false); }
   return s;
 }
 
-/** Le joueur courant a vu ses câbles : ils sont mélangés et replacés face cachée. */
-export function ackInspect(state, rng = Math.random) {
+/** Un joueur a vu ses câbles : ils sont mélangés et replacés face cachée. */
+export function ackInspect(state, player, rng = Math.random) {
   if (state.phase !== 'inspect') throw new RuleError('not-inspect');
+  assertSeat(state, player);
+  if (state.ready[player]) return state;
   const s = clone(state);
-  const p = passPlayer(s);
-  s.hands[p] = shuffle(s.hands[p], rng);
-  s.pass += 1;
-  if (s.pass === s.n) { s.phase = 'play'; s.pass = 0; }
+  s.hands[player] = shuffle(s.hands[player], rng);
+  s.ready[player] = true;
+  if (allReady(s)) { s.phase = 'play'; s.ready.fill(false); }
   return s;
 }
 
@@ -143,7 +150,7 @@ export function nextRound(state, rng = Math.random) {
   s.cuts = 0;
   s.hands = dealHands(shuffle(remaining, rng), s.n, handSize(s.round));
   s.phase = 'inspect';
-  s.pass = 0; // le dernier joueur coupé (holder) consulte en premier et commencera la manche
+  s.ready.fill(false); // le dernier joueur coupé (holder) commencera la manche
   return s;
 }
 

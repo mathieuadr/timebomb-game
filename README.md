@@ -1,24 +1,26 @@
 # ⚡ Coupe-Circuit — rôles secrets à la station polaire
 
-Un jeu de bluff pour **4 à 8 joueurs réunis autour d'une table**, avec **un seul téléphone** qui passe de main en main.
+Un jeu de bluff pour **4 à 8 joueurs réunis autour d'une table**, **chacun sur son propre téléphone**.
 Le réacteur de la station s'emballe : les Techniciens cherchent les dérivations, les Saboteurs veulent la surcharge.
 On discute, on ment et on s'accuse à voix haute ; l'appli ne fait que tenir les cartes.
 
 👉 **Jouer : https://mathieuadr.github.io/timebomb-game/**
 
 - 📱 **PWA** installable sur l'écran d'accueil (iOS : Partager → « Sur l'écran d'accueil » ; Android : « Installer l'application »)
-- ✈️ **Hors ligne** : une fois ouverte, l'appli fonctionne sans aucune connexion
-- 🔒 **Aucun compte, aucun serveur** : tout reste sur le téléphone, et la partie reprend où elle en était si l'appli se ferme
-- 🤫 **Pensée pour le téléphone partagé** : écran neutre entre deux joueurs, secrets retirés de la page dès qu'on les masque
+- 🔗 **Invitation en un geste** : code à 5 caractères ou lien partagé (`…/timebomb-game/?room=ABCDE`)
+- 🔒 **Secrets chiffrés de bout en bout** : ton rôle et tes câbles ne sont lisibles que sur ton téléphone
+- ☁️ **Sans serveur ni compte** : hébergé sur GitHub Pages, les téléphones communiquent par un relais MQTT public
+- 🔄 **Reprise** : un joueur ou l'hôte qui recharge l'appli retrouve la partie là où elle en était
 - 🔇 Sons et animations désactivables
 
 Coupe-Circuit est un jeu original : son nom, son univers et toutes ses illustrations (SVG) ont été créés pour ce projet.
 
 ## Règles en bref
 
-- Chaque joueur reçoit en secret un **rôle** et **5 câbles** : inertes, **dérivations** (autant que de joueurs) ou la **Surcharge** (une seule).
+- Un joueur crée la partie (l'**hôte**), les autres la rejoignent. L'hôte range la table et choisit les rôles en jeu.
+- Chaque joueur découvre sur son téléphone son **rôle** et ses **5 câbles** : inertes, **dérivations** (autant que de joueurs) ou la **Surcharge** (une seule).
   Après consultation, l'appli mélange les câbles face cachée.
-- Le joueur qui tient la **pince** coupe un câble caché **d'un autre joueur** ; le câble est révélé et la pince passe au joueur coupé.
+- Le joueur qui tient la **pince** coupe un câble caché **d'un autre joueur** depuis son téléphone ; tous les téléphones montrent la révélation et la pince passe au joueur coupé.
 - Une manche dure autant de coupes qu'il y a de joueurs. Les câbles restants sont alors mélangés et redistribués : 5, puis 4, 3 et 2 par joueur.
 - **Techniciens** : gagnent si toutes les dérivations sont coupées.
   **Saboteurs** : gagnent si la Surcharge est coupée, ou à la fin de la 4ᵉ manche.
@@ -41,15 +43,27 @@ Trois modes : **Classique** (deux équipes), **Infiltration** (badges, agents do
 
 ```
 public/engine/   moteur de règles pur (rules.js, game.js) — testable sans interface
-public/state/    sauvegarde locale (store.js) et cloisonnement des secrets (privacy.js)
+public/state/    cloisonnement des secrets (privacy.js) et préférences de l'appareil (store.js)
+public/net/      partie à plusieurs : relais MQTT, salon, chiffrement de bout en bout (room.js, crypto.js)
 public/ui/       illustrations SVG, sons synthétisés, composants et écrans (HTML/CSS/JS sans framework)
-public/sw.js     service worker : toute l'appli est mise en cache pour le hors-ligne
-test/            tests du moteur, simulation de parties, parties complètes en téléphone émulé
+public/vendor/   client MQTT.js (licence MIT)
+test/            tests du moteur et du réseau, simulation de parties, parties complètes en téléphones émulés
 ```
 
-Les écrans visibles de tous ne reçoivent que `publicView()` : ni équipe, ni identité d'un câble caché.
-Un écran privé ne lit que les secrets du joueur qui tient le téléphone, et revient à l'écran neutre
-après une actualisation ou un passage en arrière-plan.
+Le téléphone de l'**hôte** exécute le moteur de règles et garde l'état complet, sans jamais l'afficher. Sur le relais circulent :
+
+| Sujet | Contenu | Visibilité |
+|---|---|---|
+| `…/state` | la table : noms, câbles coupés, pince, manche | en clair, sans aucun secret |
+| `…/p/<joueur>` | rôle, câbles pendant la consultation, badge du voisin | chiffré pour ce seul joueur (ECDH P-256 + AES-GCM) |
+| `…/c/<joueur>` | actions du joueur (couper, confirmer, choisir son badge…) | chiffré pour l'hôte |
+
+Les autres joueurs, comme toute personne qui écouterait le relais, ne voient que l'état public et des messages chiffrés.
+L'hôte détient forcément tous les secrets (c'est lui l'arbitre) ; son appli ne les affiche jamais.
+Si l'hôte ferme l'appli, la partie se met en pause et reprend à son retour. Si un joueur perd la connexion,
+l'hôte peut confirmer ou couper à sa place pour débloquer la table.
+
+Pour utiliser un autre relais MQTT en WebSocket : ajoute `?broker=wss://…` à l'adresse (tous les joueurs doivent utiliser le même).
 
 ## Déploiement
 
@@ -59,9 +73,8 @@ Si le premier déploiement échoue sur « configure-pages » : **Settings → Pa
 ## Développement
 
 ```bash
-npm start            # appli sur http://localhost:8099/timebomb-game/
-npm test             # tests du moteur + 3 000 parties aléatoires vérifiées coup par coup
-npm run e2e          # 6 parties complètes dans des téléphones émulés (Playwright requis)
+npm install
+npm start            # appli + relais local : ouvre l'adresse affichée dans plusieurs onglets
+npm test             # moteur, réseau (relais local + « espion ») et 3 000 parties aléatoires
+npm run e2e          # parties complètes avec un navigateur par joueur (Playwright requis)
 ```
-
-Aucune dépendance à installer pour jouer ou pour lancer `npm start` et `npm test`.

@@ -5,9 +5,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { createGame, chooseBadge, ackRole, ackInspect, cut, nextRound, passPlayer, hiddenCount, RuleError } from '../public/engine/game.js';
+import { createGame, chooseBadge, ackRole, ackInspect, cut, nextRound, hiddenCount, RuleError } from '../public/engine/game.js';
 import { presetComposition, validateComposition, modeOf, roleDeck, wireDeck, handSize, WIRE, ROUNDS } from '../public/engine/rules.js';
-import { publicView, roleSecret, handSecret, finalReveal, PrivacyError } from '../public/state/privacy.js';
+import { publicView, privateView, finalReveal, PrivacyError } from '../public/state/privacy.js';
 import { seeded, names, ready, passRoles, passInspect, legalCuts, findCut, cutKind, quietCut, burnRound, firstSeed, tally, invariants } from './helpers.mjs';
 
 const count = (list, pred) => list.filter(pred).length;
@@ -88,42 +88,54 @@ test('câbles : composition et distribution de 4 à 8 joueurs', () => {
   }
 });
 
-// ───────────────────────────────────────────── On se passe le téléphone
+// ───────────────────────────────────────────── Chacun son téléphone : consultations en parallèle
 
-test('distribution des rôles : ordre de passage à partir du premier joueur', () => {
+test('rôles : chacun confirme de son côté, dans n\'importe quel ordre', () => {
   let s = createGame({ names: names(5), comp: presetComposition('classic', 5), firstPlayer: 3 }, seeded(2));
-  const seen = [];
-  while (s.phase === 'roles') { seen.push(passPlayer(s)); s = ackRole(s); }
-  assert.deepEqual(seen, [3, 4, 0, 1, 2]);
+  for (const p of [4, 0, 2, 1]) {
+    s = ackRole(s, p);
+    assert.equal(s.phase, 'roles', 'on attend le dernier joueur');
+  }
+  assert.deepEqual(s.ready, [true, true, true, false, true]);
+  const again = ackRole(s, 2);
+  assert.equal(again, s, 'une confirmation reçue deux fois est sans effet');
+  s = ackRole(s, 3);
   assert.equal(s.phase, 'inspect');
-  assert.equal(passPlayer(s), 3);
-  assert.throws(() => ackRole(s), code('not-roles'));
+  assert.deepEqual(s.ready, [false, false, false, false, false], 'tout le monde doit maintenant consulter ses câbles');
+  assert.equal(s.holder, 3, 'le premier joueur choisi tiendra la pince');
+  assert.throws(() => ackRole(s, 0), code('not-roles'));
+  assert.throws(() => ackRole(createGame({ names: names(5), comp: presetComposition('classic', 5) }, seeded(2)), 7), code('bad-player'));
 });
 
-test('l\'Électron libre doit choisir son badge avant de passer le téléphone', () => {
+test('l\'Électron libre doit choisir son badge avant de confirmer', () => {
   const comp = custom({ tech: 2, sab: 1, solo: 1, badges: 'neighbor' });
   let s = createGame({ names: names(4), comp }, seeded(11));
-  while (s.roles[passPlayer(s)].team !== 'solo') {
-    assert.throws(() => chooseBadge(s, 'blue'), code('not-solo'));
-    s = ackRole(s);
-  }
-  assert.throws(() => ackRole(s), code('badge-required'));
-  assert.throws(() => chooseBadge(s, 'vert'), code('bad-badge'));
-  s = chooseBadge(s, 'orange');
-  assert.equal(s.roles[passPlayer(s)].badge, 'orange');
-  assert.doesNotThrow(() => ackRole(s));
+  const solo = s.roles.findIndex((r) => r.team === 'solo');
+  const other = (solo + 1) % 4;
+  assert.throws(() => chooseBadge(s, other, 'blue'), code('not-solo'));
+  assert.throws(() => ackRole(s, solo), code('badge-required'));
+  assert.throws(() => chooseBadge(s, solo, 'vert'), code('bad-badge'));
+  s = chooseBadge(s, solo, 'orange');
+  s = chooseBadge(s, solo, 'blue'); // il peut changer d'avis tant qu'il n'a pas confirmé
+  assert.equal(s.roles[solo].badge, 'blue');
+  s = ackRole(s, solo);
+  assert.throws(() => chooseBadge(s, solo, 'orange'), code('already-ready'), 'plus de changement après confirmation');
+  const classic = createGame({ names: names(4), comp: custom({ tech: 2, sab: 1, solo: 1 }) }, seeded(11));
+  const solo2 = classic.roles.findIndex((r) => r.team === 'solo');
+  assert.throws(() => chooseBadge(classic, solo2, 'blue'), code('badges-off'));
+  assert.doesNotThrow(() => ackRole(classic, solo2), 'sans badges, rien à choisir');
 });
 
-test('consultation des câbles : la main est mélangée sans changer de contenu', () => {
+test('consultation des câbles : chaque main est mélangée sans changer de contenu', () => {
   const rng = seeded(5);
   let s = passRoles(createGame({ names: names(6), comp: presetComposition('classic', 6) }, rng));
   const before = s.hands.map((h) => h.map((c) => c.kind).sort());
   let moved = 0;
-  while (s.phase === 'inspect') {
-    const p = passPlayer(s);
+  for (const p of [5, 1, 3, 0, 4, 2]) {
     const order = s.hands[p].map((c) => c.kind).join();
-    s = ackInspect(s, rng);
+    s = ackInspect(s, p, rng);
     if (s.hands[p].map((c) => c.kind).join() !== order) moved += 1;
+    if (s.phase === 'inspect') assert.equal(ackInspect(s, p, rng), s, 'pas de second mélange');
   }
   assert.equal(s.phase, 'play');
   assert.deepEqual(s.hands.map((h) => h.map((c) => c.kind).sort()), before);
@@ -170,7 +182,7 @@ test('une action ne modifie jamais l\'état reçu', () => {
   const frozen = JSON.stringify(state);
   const [p, slot] = legalCuts(state)[0];
   cut(state, p, slot);
-  ackInspect({ ...state, phase: 'inspect' }, rng);
+  ackInspect({ ...state, phase: 'inspect' }, 0, rng);
   assert.equal(JSON.stringify(state), frozen);
 });
 
@@ -207,7 +219,7 @@ test('redistribution : 5 → 4 → 3 → 2 câbles, identités conservées, posi
         assert.deepEqual(tally(s), before, 'aucun câble perdu ni transformé');
         assert.equal(hiddenCount(s), hiddenBefore);
         assert.equal(s.holder, lastCut, 'le dernier joueur coupé commence la manche suivante');
-        assert.equal(passPlayer(s), lastCut, 'et consulte ses câbles en premier');
+        assert.ok(s.ready.every((r) => !r), 'chacun doit consulter ses nouveaux câbles');
         assert.deepEqual(invariants(s), []);
         s = passInspect(s, rng);
         assert.equal(s.holder, lastCut);
@@ -372,33 +384,46 @@ test('badges : visibles de tous seulement avec le réglage « toute la table »,
 });
 
 test('badges : en mode « voisin de gauche », chacun voit celui de son voisin de droite', () => {
-  const s = passRoles(createGame({ names: names(5), comp: presetComposition('infiltration', 5), firstPlayer: 2 }, seeded(8)));
-  const p = passPlayer(s);
-  const hand = handSecret(s, p);
-  assert.equal(hand.neighbor.player, (p + 4) % 5);
-  assert.equal(hand.neighbor.badge, s.roles[(p + 4) % 5].badge);
-  assert.equal(hand.kinds.length, 5);
-  assert.equal(hand.counts.overload + hand.counts.bypass + hand.counts.inert, 5);
+  const game = createGame({ names: names(5), comp: presetComposition('infiltration', 5), firstPlayer: 2 }, seeded(8));
+  assert.equal(privateView(game, 0).neighbor, null, 'pas de badge voisin avant que l\'Électron libre ait choisi le sien');
+  const s = passRoles(game);
+  for (let p = 0; p < 5; p++) {
+    const mine = privateView(s, p);
+    assert.equal(mine.neighbor.player, (p + 4) % 5);
+    assert.equal(mine.neighbor.badge, s.roles[(p + 4) % 5].badge);
+    assert.equal(mine.hand.kinds.length, 5);
+    assert.equal(mine.hand.counts.overload + mine.hand.counts.bypass + mine.hand.counts.inert, 5);
+  }
   const classic = passRoles(createGame({ names: names(5), comp: presetComposition('classic', 5) }, seeded(8)));
-  assert.equal(handSecret(classic, passPlayer(classic)).neighbor, null);
+  assert.equal(privateView(classic, 0).neighbor, null);
 });
 
-test('un secret n\'est lisible que par le joueur qui tient le téléphone', () => {
-  const game = createGame({ names: names(5), comp: presetComposition('infiltration', 5), firstPlayer: 1 }, seeded(3));
-  assert.doesNotThrow(() => roleSecret(game, 1));
-  for (const other of [0, 2, 3, 4]) assert.throws(() => roleSecret(game, other), PrivacyError);
-  assert.throws(() => handSecret(game, 1), PrivacyError, 'pas de câbles pendant la distribution des rôles');
-  assert.throws(() => finalReveal(game), PrivacyError);
-  const s = passRoles(game);
-  assert.doesNotThrow(() => handSecret(s, 1));
-  assert.doesNotThrow(() => roleSecret(s, 1));
-  for (const other of [0, 2, 3, 4]) assert.throws(() => handSecret(s, other), PrivacyError);
-  const playing = passInspect(s, seeded(3));
-  for (const any of [0, 1, 2, 3, 4]) {
-    assert.throws(() => roleSecret(playing, any), PrivacyError, 'plus aucun secret lisible pendant le jeu');
-    assert.throws(() => handSecret(playing, any), PrivacyError);
+test('vue privée : son rôle toujours, ses câbles seulement avant de les mélanger', () => {
+  const rng = seeded(3);
+  const game = createGame({ names: names(5), comp: presetComposition('infiltration', 5) }, rng);
+  const solo = game.roles.findIndex((r) => r.team === 'solo');
+  for (let p = 0; p < 5; p++) {
+    const v = privateView(game, p);
+    assert.deepEqual(v.role, { role: game.roles[p].role, team: game.roles[p].team, badge: game.roles[p].badge, char: game.roles[p].char });
+    assert.equal(v.hand, null, 'pas de câbles pendant la distribution des rôles');
+    assert.equal(v.needBadge, p === solo);
+    assert.equal(v.seat, p);
   }
-  assert.throws(() => finalReveal(playing), PrivacyError);
+  assert.throws(() => privateView(game, 5), PrivacyError);
+  let s = passRoles(game);
+  assert.ok(privateView(s, 1).hand);
+  s = ackInspect(s, 1, rng);
+  assert.equal(privateView(s, 1).hand, null, 'après le mélange, plus personne ne revoit ses câbles');
+  assert.ok(privateView(s, 2).hand, 'les autres n\'ont pas encore mélangé');
+  s = passInspect(s, rng, [0, 2, 3, 4]);
+  for (let p = 0; p < 5; p++) {
+    assert.equal(privateView(s, p).hand, null, 'aucun câble pendant le jeu');
+    assert.equal(privateView(s, p).role.role, s.roles[p].role, 'le rôle reste consultable');
+  }
+  // une vue privée ne contient rien sur les autres joueurs (hors badge du voisin)
+  const json = JSON.stringify(privateView(s, 0));
+  assert.ok(!/"(roles|hands|undealt|players|log)":/.test(json));
+  assert.throws(() => finalReveal(s), PrivacyError);
 });
 
 // ───────────────────────────────────────────── Sauvegarde et hors ligne
@@ -416,7 +441,8 @@ test('reprise : un état sauvegardé en JSON se rejoue à l\'identique', () => {
     } else if (live.phase === 'roundEnd') {
       live = nextRound(live, rng2); restored = nextRound(JSON.parse(JSON.stringify(restored)), rng3);
     } else if (live.phase === 'inspect') {
-      live = ackInspect(live, rng2); restored = ackInspect(JSON.parse(JSON.stringify(restored)), rng3);
+      const p = live.ready.indexOf(false);
+      live = ackInspect(live, p, rng2); restored = ackInspect(JSON.parse(JSON.stringify(restored)), p, rng3);
     }
     assert.deepEqual(restored, live);
   }

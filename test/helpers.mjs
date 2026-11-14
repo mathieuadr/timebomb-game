@@ -1,5 +1,5 @@
 // Outils communs aux tests du moteur.
-import { createGame, chooseBadge, ackRole, ackInspect, cut, nextRound, passPlayer } from '../public/engine/game.js';
+import { createGame, chooseBadge, ackRole, ackInspect, cut, nextRound } from '../public/engine/game.js';
 import { presetComposition, handSize, WIRE, TEAM, BADGES, HAND_SIZE } from '../public/engine/rules.js';
 
 /** Générateur pseudo-aléatoire reproductible (mulberry32). */
@@ -17,20 +17,21 @@ export function seeded(seed) {
 export const NAMES = ['Ada', 'Bo', 'Cléo', 'Dan', 'Eve', 'Flo', 'Gus', 'Hal'];
 export const names = (n) => NAMES.slice(0, n);
 
-/** Fait défiler la distribution des rôles (l'Électron libre prend un badge si besoin). */
-export function passRoles(state) {
+/** Chaque joueur découvre son rôle (l'Électron libre prend un badge si besoin), dans un ordre donné. */
+export function passRoles(state, order = null) {
   let s = state;
-  while (s.phase === 'roles') {
-    const r = s.roles[passPlayer(s)];
-    if (r.team === TEAM.SOLO && s.comp.badges !== BADGES.OFF && !r.badge) s = chooseBadge(s, 'blue');
-    s = ackRole(s);
+  for (const p of order || [...Array(s.n).keys()]) {
+    const r = s.roles[p];
+    if (r.team === TEAM.SOLO && s.comp.badges !== BADGES.OFF && !r.badge) s = chooseBadge(s, p, 'blue');
+    s = ackRole(s, p);
   }
   return s;
 }
 
-export function passInspect(state, rng) {
+/** Chaque joueur consulte ses câbles puis les mélange. */
+export function passInspect(state, rng, order = null) {
   let s = state;
-  while (s.phase === 'inspect') s = ackInspect(s, rng);
+  for (const p of order || [...Array(s.n).keys()]) s = ackInspect(s, p, rng);
   return s;
 }
 

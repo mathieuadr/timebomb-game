@@ -1,7 +1,7 @@
 {
   "name": "Coupe-Circuit — rôles secrets à la station polaire",
   "short_name": "Coupe-Circuit",
-  "description": "Jeu de rôles secrets pour 4 à 8 joueurs, avec un seul téléphone. Hors ligne, sans compte.",
+  "description": "Jeu de rôles secrets pour 4 à 8 joueurs autour d'une table, chacun sur son téléphone. Sans compte.",
   "lang": "fr",
   "dir": "ltr",
   "start_url": "./",

@@ -1,18 +1,19 @@
 // Coupe-Circuit — cloisonnement des informations.
-// L'interface ne lit JAMAIS `state.roles`, `state.hands` ou `state.undealt` directement :
-//   • les écrans publics passent par publicView() ;
-//   • un écran privé passe par roleSecret() / handSecret(), qui refusent tout autre joueur
-//     que celui qui tient le téléphone à cet instant ;
-//   • finalReveal() ne répond qu'une fois la partie terminée.
+//
+// Trois niveaux, jamais mélangés :
+//   • publicView(state)          → ce que tous les téléphones reçoivent (en clair sur le relais) ;
+//   • privateView(state, player) → ce que reçoit UN joueur, chiffré pour son seul téléphone ;
+//   • finalReveal(state)         → les rôles de tous, uniquement une fois la partie terminée.
+// L'état complet (state) ne quitte jamais le téléphone de l'hôte.
 
-import { ROUNDS, WIRE, BADGES } from '../engine/rules.js';
-import { passPlayer, hiddenCount } from '../engine/game.js';
+import { ROUNDS, WIRE, BADGES, TEAM } from '../engine/rules.js';
+import { hiddenCount } from '../engine/game.js';
 
 export class PrivacyError extends Error {
   constructor(message) { super(message); this.name = 'PrivacyError'; }
 }
 
-/** Tout ce qu'un écran visible de toute la table a le droit de connaître. */
+/** Tout ce que la table entière a le droit de connaître. */
 export function publicView(state) {
   const badgesPublic = state.comp.badges === BADGES.PUBLIC && state.phase !== 'roles';
   return {
@@ -24,8 +25,7 @@ export function publicView(state) {
     found: state.found,
     total: state.n,
     holder: state.holder,
-    pass: state.pass,
-    passPlayer: state.phase === 'roles' || state.phase === 'inspect' ? passPlayer(state) : null,
+    ready: state.ready.slice(), // qui a fini de consulter son rôle / ses câbles
     hidden: hiddenCount(state),
     comp: { ...state.comp },
     undealtCount: state.undealt.length,
@@ -43,29 +43,37 @@ export function publicView(state) {
   };
 }
 
-function assertHolder(state, player, phases) {
-  if (!phases.includes(state.phase) || passPlayer(state) !== player) {
-    throw new PrivacyError('Information privée demandée hors du tour du joueur.');
-  }
-}
-
-/** Carte Rôle du joueur qui tient le téléphone (distribution des rôles, ou rappel pendant sa consultation). */
-export function roleSecret(state, player) {
-  assertHolder(state, player, ['roles', 'inspect']);
+/**
+ * Ce qu'un joueur a le droit de savoir, et lui seul :
+ *   • son rôle (à tout moment : c'est sa carte, il peut la revoir) ;
+ *   • ses câbles, uniquement pendant la consultation et tant qu'il ne les a pas mélangés ;
+ *   • le badge de son voisin de droite si le réglage « voisin de gauche » est actif.
+ */
+export function privateView(state, player) {
+  if (!Number.isInteger(player) || player < 0 || player >= state.n) throw new PrivacyError('Joueur inconnu.');
   const r = state.roles[player];
-  return { role: r.role, team: r.team, badge: r.badge, char: r.char, badges: state.comp.badges };
-}
-
-/** Câbles du joueur qui tient le téléphone, triés (leur ordre réel n'a aucune importance : il sera mélangé). */
-export function handSecret(state, player) {
-  assertHolder(state, player, ['inspect']);
-  const order = [WIRE.OVERLOAD, WIRE.BYPASS, WIRE.INERT];
-  const kinds = state.hands[player].map((c) => c.kind).sort((a, b) => order.indexOf(a) - order.indexOf(b));
-  const count = (k) => kinds.filter((x) => x === k).length;
+  const inspecting = state.phase === 'inspect' && !state.ready[player];
+  let hand = null;
+  if (inspecting) {
+    // triés : l'ordre affiché ne dit rien de la position réelle, qui sera de toute façon remélangée
+    const order = [WIRE.OVERLOAD, WIRE.BYPASS, WIRE.INERT];
+    const kinds = state.hands[player].map((c) => c.kind).sort((a, b) => order.indexOf(a) - order.indexOf(b));
+    const count = (k) => kinds.filter((x) => x === k).length;
+    hand = { kinds, counts: { overload: count(WIRE.OVERLOAD), bypass: count(WIRE.BYPASS), inert: count(WIRE.INERT) } };
+  }
   // « Chacun montre son badge à son voisin de gauche » : je vois donc celui de mon voisin de droite.
   const right = (player - 1 + state.n) % state.n;
-  const neighbor = state.comp.badges === BADGES.NEIGHBOR ? { player: right, name: state.players[right].name, badge: state.roles[right].badge } : null;
-  return { kinds, counts: { overload: count(WIRE.OVERLOAD), bypass: count(WIRE.BYPASS), inert: count(WIRE.INERT) }, neighbor };
+  const neighbor = state.comp.badges === BADGES.NEIGHBOR && state.phase !== 'roles'
+    ? { player: right, name: state.players[right].name, badge: state.roles[right].badge }
+    : null;
+  return {
+    seat: player,
+    role: { role: r.role, team: r.team, badge: r.badge, char: r.char },
+    badges: state.comp.badges,
+    needBadge: state.phase === 'roles' && r.team === TEAM.SOLO && state.comp.badges !== BADGES.OFF && !r.badge,
+    hand,
+    neighbor,
+  };
 }
 
 /** Révélation finale : uniquement quand la partie est terminée. */

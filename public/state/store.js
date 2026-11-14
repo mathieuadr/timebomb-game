@@ -1,63 +1,30 @@
-// Coupe-Circuit — état de l'application et sauvegarde locale automatique.
-// Tout est conservé sur le téléphone (localStorage) : aucun serveur, aucun compte.
-// L'état complet de la partie y figure pour permettre la reprise, mais il n'est jamais affiché :
-// les écrans ne le lisent qu'à travers state/privacy.js.
+// Coupe-Circuit — préférences de l'appareil et accès au stockage local.
+// La partie elle-même est sauvegardée par la couche réseau (net/room.js) : chez l'hôte l'état
+// complet, chez chaque joueur seulement de quoi se reconnecter.
 
-import { STATE_VERSION } from '../engine/game.js';
-import { MAX_PLAYERS, MODE, presetComposition } from '../engine/rules.js';
-
-const KEY = 'coupe-circuit:v1';
-
-export function defaultDraft() {
-  return {
-    n: 5,
-    names: Array(MAX_PLAYERS).fill(''),
-    first: 'random', // 'random' ou index du premier joueur
-    mode: MODE.CLASSIC,
-    comp: presetComposition(MODE.CLASSIC, 5),
-  };
-}
-
-const prefersReduced = () => typeof matchMedia === 'function' && matchMedia('(prefers-reduced-motion: reduce)').matches;
-
-export const store = {
-  game: null,
-  draft: defaultDraft(),
-  settings: { sound: true, motion: !prefersReduced() },
-
-  load() {
-    try {
-      const raw = localStorage.getItem(KEY);
-      if (!raw) return;
-      const data = JSON.parse(raw);
-      if (data.settings) this.settings = { ...this.settings, ...data.settings };
-      if (data.draft && Array.isArray(data.draft.names)) this.draft = { ...defaultDraft(), ...data.draft };
-      if (data.game && data.game.v === STATE_VERSION) this.game = data.game;
-    } catch {
-      // sauvegarde illisible : on repart d'une appli vierge
-    }
+/** Stockage JSON tolérant aux erreurs (navigation privée, quota plein…). */
+export const storage = {
+  get(key) {
+    try { const v = localStorage.getItem(key); return v == null ? null : JSON.parse(v); } catch { return null; }
   },
-
-  save() {
-    try {
-      localStorage.setItem(KEY, JSON.stringify({ settings: this.settings, draft: this.draft, game: this.game }));
-    } catch {
-      // stockage indisponible (navigation privée, quota) : la partie continue en mémoire
-    }
+  set(key, value) {
+    try { localStorage.setItem(key, JSON.stringify(value)); } catch { /* sans stockage, la partie continue en mémoire */ }
   },
-
-  setGame(game) { this.game = game; this.save(); },
-  clearGame() { this.game = null; this.save(); },
-  setDraft(patch) { this.draft = { ...this.draft, ...patch }; this.save(); },
-  setSetting(key, value) { this.settings = { ...this.settings, [key]: value }; this.save(); },
+  del(key) {
+    try { localStorage.removeItem(key); } catch { /* idem */ }
+  },
 };
 
-/** Hasard de qualité cryptographique quand il est disponible (mélanges et tirages). */
-export function rng() {
-  if (globalThis.crypto?.getRandomValues) {
-    const buf = new Uint32Array(1);
-    globalThis.crypto.getRandomValues(buf);
-    return buf[0] / 4294967296;
-  }
-  return Math.random();
-}
+const KEY = 'cc:prefs';
+const prefersReduced = () => typeof matchMedia === 'function' && matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+export const prefs = {
+  name: '',
+  sound: true,
+  motion: !prefersReduced(),
+  load() { Object.assign(this, storage.get(KEY) || {}); },
+  set(key, value) {
+    this[key] = value;
+    storage.set(KEY, { name: this.name, sound: this.sound, motion: this.motion });
+  },
+};
