@@ -1,0 +1,20 @@
+{
+  "name": "Coupe-Circuit — rôles secrets à la station polaire",
+  "short_name": "Coupe-Circuit",
+  "description": "Jeu de rôles secrets pour 4 à 8 joueurs, avec un seul téléphone. Hors ligne, sans compte.",
+  "lang": "fr",
+  "dir": "ltr",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#050b18",
+  "theme_color": "#050b18",
+  "categories": ["games", "entertainment"],
+  "icons": [
+    { "src": "./icons/icon.svg", "sizes": "any", "type": "image/svg+xml" },
+    { "src": "./icons/icon-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "./icons/icon-512.png", "sizes": "512x512", "type": "image/png" },
+    { "src": "./icons/icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}

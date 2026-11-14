@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
+  <title>Coupe-Circuit — rôles secrets à la station polaire</title>
+  <meta name="description" content="Jeu de rôles secrets pour 4 à 8 joueurs autour d'une table, avec un seul téléphone. Hors ligne, sans compte." />
+  <meta name="theme-color" content="#050b18" />
+  <meta name="color-scheme" content="dark" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="Coupe-Circuit" />
+  <meta name="format-detection" content="telephone=no" />
+  <link rel="manifest" href="./manifest.webmanifest" />
+  <link rel="icon" href="./icons/icon.svg" type="image/svg+xml" />
+  <link rel="apple-touch-icon" href="./icons/apple-touch-icon.png" />
+  <link rel="stylesheet" href="./style.css" />
+</head>
+<body>
+  <div class="sky" aria-hidden="true"></div>
+  <main id="app"></main>
+  <div id="layer"></div>
+  <div id="toasts" aria-live="polite"></div>
+  <div id="rotate" aria-hidden="true">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="7" y="2.5" width="10" height="19" rx="2.5"/><path d="M11 18.5h2"/></svg>
+    <p>Tourne ton téléphone à la verticale</p>
+  </div>
+  <noscript><p style="padding:24px;color:#fff">Coupe-Circuit a besoin de JavaScript pour fonctionner.</p></noscript>
+  <script type="module" src="./app.js"></script>
+</body>
+</html>

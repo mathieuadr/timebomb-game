@@ -1,0 +1,16 @@
+{
+  "name": "coupe-circuit",
+  "version": "1.0.0",
+  "description": "Coupe-Circuit — jeu de rôles secrets sur téléphone partagé (PWA hors ligne, sans serveur)",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "start": "node test/serve.mjs",
+    "test": "node --test test/engine.test.mjs && node test/simulate.mjs 200",
+    "e2e": "node test/e2e.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT"
+}
